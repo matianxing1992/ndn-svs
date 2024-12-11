@@ -15,12 +15,11 @@
  */
 
 #include "svspubsub.hpp"
+#include "tlv.hpp"
 
 #include <ndn-cxx/util/segment-fetcher.hpp>
 
 #include <chrono>
-
-
 
 namespace ndn::svs {
 
@@ -43,9 +42,10 @@ SVSPubSub::SVSPubSub(const Name& syncPrefix,
              securityOptions,
              options.dataStore)
   , m_mappingProvider(syncPrefix, nodePrefix, face, securityOptions)
+  , m_piggyDataCache(1024)
 {
   m_svsync.getCore().setGetExtraBlockCallback(std::bind(&SVSPubSub::onGetExtraData, this, _1));
-  m_svsync.getCore().setRecvExtraBlockCallback(std::bind(&SVSPubSub::onRecvExtraData, this, _1));
+  m_svsync.getCore().setRecvExtraBlockCallback(std::bind(&SVSPubSub::onRecvExtraData, this, _1, _2));
 }
 
 SeqNo
@@ -90,6 +90,9 @@ SVSPubSub::publish(const Name& name,
     data.setContent(value);
     data.setFreshnessPeriod(freshnessPeriod);
     m_securityOptions.dataSigner->sign(data);
+    // if the data size is smaller than MAX_SIZE_OF_PIGGYDATA, add it to the piggyback queue
+    if (data.wireEncode().size() <= MAX_SIZE_OF_PIGGYDATA)
+      m_piggyDataQueue.push(data);
     return publishPacket(data, nodePrefix);
   }
 }
@@ -131,7 +134,7 @@ SVSPubSub::insertMapping(const NodeID& nid, SeqNo seqNo, const Name& name, std::
     unsigned long now = std::chrono::duration_cast<std::chrono::microseconds>(
                           std::chrono::system_clock::now().time_since_epoch())
                           .count();
-    auto timestamp = Name::Component::fromNumber(now, tlv::TimestampNameComponent);
+    auto timestamp = Name::Component::fromNumber(now, ndn::tlv::TimestampNameComponent);
     additional.push_back(timestamp);
   }
 
@@ -161,7 +164,7 @@ uint32_t
 SVSPubSub::subscribeWithRegex(const Regex &regex, const SubscriptionCallback &callback,bool autofetch, bool packets)
 {
   uint32_t handle = ++m_subscriptionCount;
-  Subscription sub = { handle, ndn::Name(), callback, packets, false, autofetch, make_shared<Regex>(regex)};
+  Subscription sub = { handle, ndn::Name(), callback, packets, false, autofetch, std::make_shared<Regex>(regex)};
   m_regexSubscriptions.push_back(sub);
   return handle;
 }
@@ -271,7 +274,7 @@ SVSPubSub::processMapping(const NodeID& nodeId, SeqNo seqNo)
     // look for the additional timestamp block
     // if no timestamp block is present, we just skip this step
     for (const auto& block : mapping.second) {
-      if (block.type() != tlv::TimestampNameComponent)
+      if (block.type() != ndn::tlv::TimestampNameComponent)
         continue;
 
       unsigned long now = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -286,16 +289,25 @@ SVSPubSub::processMapping(const NodeID& nodeId, SeqNo seqNo)
     }
   }
 
-  // check if known mapping matches subscription
   bool queued = false;
-  for (const auto& sub : m_prefixSubscriptions) {
-    if (!sub.prefix.isPrefixOf(mapping.first)) {
-      continue;
-    }
-
+  auto queueOrDeliver = [this, &queued, &mapping, &nodeId, seqNo](const Subscription& sub) {
     if (sub.autofetch) {
-      m_fetchMap[std::pair(nodeId, seqNo)].push_back(sub);
-      queued = true;
+      auto data = m_piggyDataCache.find(mapping.first);
+      if (data != nullptr) {
+        std::optional<Data> packet = *data;
+        SubscriptionData subData = {
+          mapping.first,
+          data->getContent().value_bytes(),
+          nodeId,
+          seqNo,
+          packet
+        };
+        sub.callback(subData);
+      }
+      else {
+        m_fetchMap[std::pair(nodeId, seqNo)].push_back(sub);
+        queued = true;
+      }
     }
     else {
       SubscriptionData subData = {
@@ -306,26 +318,18 @@ SVSPubSub::processMapping(const NodeID& nodeId, SeqNo seqNo)
         std::nullopt
       };
       sub.callback(subData);
+    }
+  };
+
+  // check if known mapping matches subscription
+  for (const auto& sub : m_prefixSubscriptions) {
+    if (sub.prefix.isPrefixOf(mapping.first)) {
+      queueOrDeliver(sub);
     }
   }
   for (const auto& sub : m_regexSubscriptions) {
-    if (!sub.regex->match(mapping.first)) {
-      continue;
-    }
-
-    if (sub.autofetch) {
-      m_fetchMap[std::pair(nodeId, seqNo)].push_back(sub);
-      queued = true;
-    }
-    else {
-      SubscriptionData subData = {
-        mapping.first,
-        ndn::span<const uint8_t>{},
-        nodeId,
-        seqNo,
-        std::nullopt
-      };
-      sub.callback(subData);
+    if (sub.regex->match(mapping.first)) {
+      queueOrDeliver(sub);
     }
   }
 
@@ -489,17 +493,43 @@ Block
 SVSPubSub::onGetExtraData(const VersionVector&)
 {
   MappingList copy = m_notificationMappingList;
+  ndn::Block block = copy.encode();
+
+  size_t size = block.size();
+  while (!m_piggyDataQueue.empty()) {
+    const auto& data = m_piggyDataQueue.front();
+    auto dataBlock = data.wireEncode();
+    if (size + dataBlock.size() > MAX_SIZE_OF_APPLICATION_PARAMETERS) {
+      break;
+    }
+
+    block.push_back(dataBlock);
+    size += dataBlock.size();
+    m_piggyDataQueue.pop();
+  }
+  block.encode();
+
   m_notificationMappingList = MappingList();
-  return copy.encode();
+  std::queue<ndn::Data> empty;
+  std::swap(m_piggyDataQueue, empty);
+
+  return block;
 }
 
 void
-SVSPubSub::onRecvExtraData(const Block& block)
+SVSPubSub::onRecvExtraData(const Block& block, const VersionVector&)
 {
   try {
     MappingList list(block);
     for (const auto& p : list.pairs) {
       m_mappingProvider.insertMapping(list.nodeId, p.first, p.second);
+    }
+
+    block.parse();
+    for (const auto& childBlock : block.elements()) {
+      if (childBlock.type() == ndn::tlv::Data) {
+        m_piggyDataCache.insert(ndn::Data(childBlock));
+      }
     }
   } catch (const std::exception&) {
   }
