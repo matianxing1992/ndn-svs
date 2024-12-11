@@ -25,6 +25,9 @@
 
 #include <ndn-cxx/security/validator-null.hpp>
 #include <ndn-cxx/util/regex.hpp>
+#include <ndn-cxx/ims/in-memory-storage-fifo.hpp>
+
+#include <queue>
 
 namespace ndn::svs {
 
@@ -216,7 +219,7 @@ private:
 
   Block onGetExtraData(const VersionVector& vv);
 
-  void onRecvExtraData(const Block& block);
+  void onRecvExtraData(const Block& block, const VersionVector& vv);
 
   /// @brief Insert a mapping entry into the store
   void insertMapping(const NodeID& nid, SeqNo seqNo, const Name& name, std::vector<Block> additional);
@@ -264,6 +267,13 @@ private:
   // Queue of publications to fetch
   std::map<std::pair<Name, SeqNo>, std::vector<Subscription>> m_fetchMap;
   std::map<std::pair<Name, SeqNo>, bool> m_fetchingMap;
+
+  size_t MAX_SIZE_OF_APPLICATION_PARAMETERS = 4096;
+  size_t MAX_SIZE_OF_PIGGYDATA = 800;
+  // Queue of Pending Piggy Data (to be sent in the next update with sync interest) : First in first out
+  std::queue<ndn::Data> m_piggyDataQueue;
+  // A cache for received piggy data
+  ndn::InMemoryStorageFifo m_piggyDataCache;
 };
 
 } // namespace ndn::svs
