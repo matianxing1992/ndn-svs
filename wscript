@@ -104,6 +104,8 @@ def configure(conf):
     conf.write_config_header('config.hpp', define_prefix='NDN_SVS_')
 
 def build(bld):
+    version(bld)
+
     libndn_svs = dict(
         target='ndn-svs',
         source=bld.path.ant_glob('ndn-svs/**/*.cpp'),
@@ -115,8 +117,8 @@ def build(bld):
     if bld.env.enable_shared:
         bld.shlib(
             name='ndn-svs',
-            vnum=VERSION,
-            cnum=VERSION,
+            vnum=VERSION_BASE,
+            cnum=VERSION_BASE,
             **libndn_svs)
 
     if bld.env.enable_static:
@@ -139,7 +141,7 @@ def build(bld):
         source='libndn-svs.pc.in',
         target='libndn-svs.pc',
         install_path='${LIBDIR}/pkgconfig',
-        VERSION=VERSION)
+        VERSION=VERSION_BASE)
 
 def doxygen(bld):
     version(bld)
