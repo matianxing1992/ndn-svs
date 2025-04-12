@@ -15,15 +15,23 @@ APT_PKGS=(
     libboost-thread-dev
     libsqlite3-dev
     libssl-dev
-    pkg-config
+    pkgconf
     python3
 )
+DNF_PKGS=(
+    boost-devel
+    gcc-c++
+    libasan
+    lld
+    openssl-devel
+    pkgconf
+    python3
+    sqlite-devel
+)
 FORMULAE=(boost openssl pkgconf)
-PIP_PKGS=()
 case $JOB_NAME in
     *code-coverage)
-        APT_PKGS+=(lcov python3-pip)
-        PIP_PKGS+=('gcovr~=5.2')
+        APT_PKGS+=(lcov libjson-xs-perl)
         ;;
     *Docs)
         APT_PKGS+=(doxygen graphviz)
@@ -34,6 +42,7 @@ esac
 set -x
 
 if [[ $ID == macos ]]; then
+    export HOMEBREW_COLOR=1
     export HOMEBREW_NO_ENV_HINTS=1
     if [[ -n $GITHUB_ACTIONS ]]; then
         export HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1
@@ -44,10 +53,5 @@ elif [[ $ID_LIKE == *debian* ]]; then
     sudo apt-get update -qq
     sudo apt-get install -qy --no-install-recommends "${APT_PKGS[@]}"
 elif [[ $ID_LIKE == *fedora* ]]; then
-    sudo dnf install -y gcc-c++ libasan lld pkgconf-pkg-config python3 \
-                        boost-devel openssl-devel sqlite-devel
-fi
-
-if (( ${#PIP_PKGS[@]} )); then
-    pip3 install --user --upgrade --upgrade-strategy=eager "${PIP_PKGS[@]}"
+    sudo dnf install -y "${DNF_PKGS[@]}"
 fi

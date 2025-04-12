@@ -26,7 +26,7 @@ To build ndn-svs from source:
 To build on memory constrained systems, please use `./waf -j1` instead of `./waf`. This
 will disable parallel compilation.
 
-### Examples
+## Examples
 
 To try out the demo CLI chat application:
 
@@ -48,7 +48,7 @@ where `sync-prefix` is `/ndn/svs` for the example application.
 
 Contributions are welcome through GitHub.
 Use `clang-format` to format the code before submitting a pull request.
-The VS Code extension for `clang-format` is recommended to format the code automatically.
+The Visual Studio Code extension for `clang-format` is recommended to format the code automatically.
 
 ## License
 
