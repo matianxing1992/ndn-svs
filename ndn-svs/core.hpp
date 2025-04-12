@@ -183,9 +183,9 @@ public:
   struct MergeResult
   {
     /// @brief If the local state vector has newer entries
-    bool myVectorNew;
+    bool myVectorNew = false;
     /// @brief If the incoming state vector has newer entries
-    bool otherVectorNew;
+    bool otherVectorNew = false;
     /// @brief Newly learned missing information from incoming state vector
     std::vector<MissingDataInfo> missingInfo;
   };
