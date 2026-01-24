@@ -4,7 +4,7 @@ libdir=@libdir@
 includedir=@includedir@
 
 Name: libndn-svs
-Description: NDN SVS library
+Description: NDN State Vector Sync Library
 Version: @VERSION@
 Libs: -L${libdir} @EXTRA_LINKFLAGS@ @EXTRA_LDFLAGS@ -lndn-svs @EXTRA_LIBS@ @EXTRA_FRAMEWORKS@
 Cflags: -I${includedir} @EXTRA_CXXFLAGS@ @EXTRA_INCLUDES@
