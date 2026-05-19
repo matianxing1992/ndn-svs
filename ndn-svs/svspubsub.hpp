@@ -201,7 +201,7 @@ public:
     return m_svsync;
   }
 
-private:
+NDN_SVS_PUBLIC_WITH_TESTS_ELSE_PRIVATE:
   struct Subscription
   {
     uint32_t id;
@@ -220,6 +220,9 @@ private:
   Block onGetExtraData(const VersionVector& vv);
 
   void onRecvExtraData(const Block& block, const VersionVector& vv);
+
+  bool
+  satisfyPendingFetchFromPiggyData(const Data& data);
 
   /// @brief Insert a mapping entry into the store
   void insertMapping(const NodeID& nid, SeqNo seqNo, const Name& name, std::vector<Block> additional);
