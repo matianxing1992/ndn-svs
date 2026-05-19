@@ -489,6 +489,44 @@ SVSPubSub::cleanUpFetch(const std::pair<Name, SeqNo>& publication)
   m_fetchingMap.erase(publication);
 }
 
+bool
+SVSPubSub::satisfyPendingFetchFromPiggyData(const Data& data)
+{
+  std::vector<std::pair<std::pair<Name, SeqNo>, std::vector<Subscription>>> ready;
+
+  for (const auto& entry : m_fetchMap)
+  {
+    const auto& publication = entry.first;
+    try {
+      auto mapping = m_mappingProvider.getMapping(publication.first, publication.second);
+      if (mapping.first == data.getName()) {
+        ready.push_back(entry);
+      }
+    }
+    catch (const std::exception&) {
+    }
+  }
+
+  for (const auto& [publication, subscriptions] : ready)
+  {
+    std::optional<Data> packet(data);
+    SubscriptionData subData = {
+      data.getName(),
+      data.getContent().value_bytes(),
+      publication.first,
+      publication.second,
+      packet,
+    };
+
+    for (const auto& sub : subscriptions) {
+      sub.callback(subData);
+    }
+    cleanUpFetch(publication);
+  }
+
+  return !ready.empty();
+}
+
 Block
 SVSPubSub::onGetExtraData(const VersionVector&)
 {
@@ -527,8 +565,17 @@ SVSPubSub::onRecvExtraData(const Block& block, const VersionVector&)
 
     block.parse();
     for (const auto& childBlock : block.elements()) {
+      if (childBlock.type() == ndn::svs::tlv::MappingData) {
+        MappingList childList(childBlock);
+        for (const auto& p : childList.pairs) {
+          m_mappingProvider.insertMapping(childList.nodeId, p.first, p.second);
+        }
+      }
+
       if (childBlock.type() == ndn::tlv::Data) {
-        m_piggyDataCache.insert(ndn::Data(childBlock));
+        ndn::Data data(childBlock);
+        m_piggyDataCache.insert(data);
+        satisfyPendingFetchFromPiggyData(data);
       }
     }
   } catch (const std::exception&) {
