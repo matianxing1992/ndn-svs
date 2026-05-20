@@ -95,11 +95,24 @@ public:
     uint64_t syncInterestSerialHandlerMs = 0;
     uint64_t syncInterestParallelTotalMs = 0;
     uint64_t syncInterestMainThreadBlockingMs = 0;
+    uint64_t syncProductionJobsSubmitted = 0;
+    uint64_t syncProductionJobsCompleted = 0;
+    uint64_t syncProductionJobsDropped = 0;
+    uint64_t syncProductionJobsStale = 0;
+    uint64_t syncProductionWorkerQueueDepth = 0;
+    uint64_t syncProductionWorkerProcessingMs = 0;
+    uint64_t syncProductionParallelTotalMs = 0;
   };
 
   void
   setParallelSyncProcessing(bool enabled, size_t workerThreads = 1,
                             size_t maxQueueSize = 1024);
+
+  void
+  setParallelSyncProduction(bool enabled, size_t workerThreads = 1,
+                            size_t maxQueueSize = 1024,
+                            bool signInWorker = false,
+                            bool buildExtraBlockInWorker = false);
 
   /**
    * @brief Experimentally coalesce locally triggered sync interests.
@@ -111,6 +124,18 @@ public:
   void
   setSyncInterestBatching(bool enabled,
                           time::milliseconds window = 5_ms);
+
+  /**
+   * @brief Set the maximum randomized suppression delay for replying to Sync
+   * Interests when this node has newer state.
+   *
+   * This is an implementation timer only; it does not affect the SVS wire
+   * format or protocol semantics. Smaller values are useful for small,
+   * latency-sensitive groups, while larger values reduce duplicate Sync
+   * Interests in large groups.
+   */
+  void
+  setMaxSuppressionTime(time::milliseconds delay);
 
   SyncProcessingStats
   getSyncProcessingStats() const;
@@ -231,6 +256,19 @@ public:
     std::vector<MissingDataInfo> missingInfo;
   };
 
+  void
+  sendSyncInterestSerial();
+
+  /**
+   * @brief Send a Sync Interest for a local publication.
+   *
+   * Local publications must advertise the newly increased sequence number even
+   * if a recently received remote state vector would otherwise suppress a
+   * normal retransmission timer.
+   */
+  void
+  sendLocalPublicationSyncInterest();
+
   /**
    * @brief Merge state vector into the current
    * @param vvOther state vector to merge in
@@ -281,10 +319,18 @@ public:
 private:
   struct SyncProcessingJob;
   struct SyncProcessingResult;
+  struct SyncProductionJob;
+  struct SyncProductionResult;
   class SyncWorkerPool;
 
   void
   processSyncInterestResult(SyncProcessingResult result);
+
+  void
+  processSyncProductionResult(SyncProductionResult result);
+
+  void
+  signSyncInterest(Interest& interest);
 
   void
   schedulePublicationSync();
@@ -361,6 +407,20 @@ private:
   std::atomic<uint64_t> m_syncInterestSerialHandlerMs{0};
   std::atomic<uint64_t> m_syncInterestParallelTotalMs{0};
   std::atomic<uint64_t> m_syncInterestMainThreadBlockingMs{0};
+
+  std::atomic<bool> m_parallelSyncProduction{false};
+  std::atomic<bool> m_parallelSyncProductionSigning{false};
+  std::atomic<bool> m_parallelSyncProductionExtraBlock{false};
+  std::shared_ptr<std::atomic<bool>> m_syncProductionAlive;
+  std::unique_ptr<SyncWorkerPool> m_syncProductionWorkerPool;
+  std::mutex m_syncProductionSigningMutex;
+  std::atomic<uint64_t> m_syncProductionJobsSubmitted{0};
+  std::atomic<uint64_t> m_syncProductionJobsCompleted{0};
+  std::atomic<uint64_t> m_syncProductionJobsDropped{0};
+  std::atomic<uint64_t> m_syncProductionJobsStale{0};
+  std::atomic<uint64_t> m_syncProductionWorkerQueueDepth{0};
+  std::atomic<uint64_t> m_syncProductionWorkerProcessingMs{0};
+  std::atomic<uint64_t> m_syncProductionParallelTotalMs{0};
 };
 
 } // namespace ndn::svs
