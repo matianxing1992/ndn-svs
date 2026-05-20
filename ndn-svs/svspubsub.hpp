@@ -25,9 +25,15 @@
 
 #include <ndn-cxx/security/validator-null.hpp>
 #include <ndn-cxx/util/regex.hpp>
-#include <ndn-cxx/ims/in-memory-storage-fifo.hpp>
 
+#include <deque>
+#include <map>
+#include <mutex>
 #include <queue>
+#include <atomic>
+#include <optional>
+
+#include <boost/asio/thread_pool.hpp>
 
 namespace ndn::svs {
 
@@ -81,7 +87,7 @@ public:
             const SVSPubSubOptions& options = {},
             const SecurityOptions& securityOptions = SecurityOptions::DEFAULT);
 
-  virtual ~SVSPubSub() = default;
+  virtual ~SVSPubSub();
 
   struct SubscriptionData
   {
@@ -121,6 +127,21 @@ public:
                 std::vector<Block> mappingBlocks = {});
 
   /**
+   * @brief Queue a publication and return immediately with a reserved seqNo.
+   *
+   * The existing publish() API remains synchronous. This API copies the input
+   * bytes, reserves a sequence number, and prepares signing, encoding, data-store,
+   * and mapping work on the async publication worker pool. The Face/io_context
+   * thread only commits prepared publications in sequence order and performs the
+   * final Face/update operations.
+   */
+  SeqNo
+  publishAsync(const Name& name, span<const uint8_t> value,
+               const Name& nodePrefix = EMPTY_NAME,
+               time::milliseconds freshnessPeriod = FRESH_FOREVER,
+               std::vector<Block> mappingBlocks = {});
+
+  /**
    * @brief Publish data names only on the pub/sub group.
    *
    * @param name name for the publication
@@ -133,6 +154,12 @@ public:
           const Name& nodePrefix = EMPTY_NAME,
           time::milliseconds freshnessPeriod = FRESH_FOREVER,
           std::vector<Block> mappingBlocks = {});
+
+  SeqNo
+  publishAsync(const Name& name,
+               const Name& nodePrefix = EMPTY_NAME,
+               time::milliseconds freshnessPeriod = FRESH_FOREVER,
+               std::vector<Block> mappingBlocks = {});
 
   /**
    * @brief Subscribe to a application name prefix.
@@ -195,6 +222,11 @@ public:
                       const Name& nodePrefix = EMPTY_NAME,
                       std::vector<Block> mappingBlocks = {});
 
+  SeqNo
+  publishPacketAsync(const Data& data,
+                     const Name& nodePrefix = EMPTY_NAME,
+                     std::vector<Block> mappingBlocks = {});
+
   /** @brief Get the underlying sync */
   SVSync& getSVSync()
   {
@@ -238,6 +270,65 @@ NDN_SVS_PUBLIC_WITH_TESTS_ELSE_PRIVATE:
 
   void cleanUpFetch(const std::pair<Name, SeqNo>& publication);
 
+  SeqNo
+  reserveSeqNo(const NodeID& nid);
+
+  struct AsyncPublication
+  {
+    enum class Kind
+    {
+      Bytes,
+      NameOnly,
+      Packet
+    };
+
+    Kind kind = Kind::Bytes;
+    SeqNo seqNo = 0;
+    Name name;
+    Name nodePrefix;
+    time::milliseconds freshnessPeriod = FRESH_FOREVER;
+    std::vector<uint8_t> value;
+    Data packet;
+    std::vector<Block> mappingBlocks;
+  };
+
+  struct PreparedPublication
+  {
+    SeqNo seqNo = 0;
+    Name nodePrefix;
+    Name mappingName;
+    time::milliseconds freshnessPeriod = FRESH_FOREVER;
+    std::vector<Data> outerPackets;
+    std::optional<Data> piggyPacket;
+    std::vector<Block> mappingBlocks;
+    bool putFirstPacketToFace = false;
+    bool ok = true;
+  };
+
+  void
+  enqueueAsyncPublication(AsyncPublication publication);
+
+  void
+  prepareAsyncPublication(AsyncPublication publication);
+
+  void
+  onPreparedPublication(PreparedPublication publication);
+
+  void
+  commitReadyPreparedPublications(const NodeID& nid);
+
+  void
+  commitPreparedPublication(const PreparedPublication& publication);
+
+  PreparedPublication
+  prepareReservedBytes(const AsyncPublication& publication);
+
+  PreparedPublication
+  prepareReservedNameOnly(const AsyncPublication& publication);
+
+  PreparedPublication
+  prepareReservedPacket(const AsyncPublication& publication);
+
 public:
   static inline const Name EMPTY_NAME;
   static constexpr size_t MAX_DATA_SIZE = 8000;
@@ -275,8 +366,23 @@ private:
   size_t MAX_SIZE_OF_PIGGYDATA = 800;
   // Queue of Pending Piggy Data (to be sent in the next update with sync interest) : First in first out
   std::queue<ndn::Data> m_piggyDataQueue;
-  // A cache for received piggy data
-  ndn::InMemoryStorageFifo m_piggyDataCache;
+  // A bounded cache for received piggyback Data. This intentionally avoids
+  // ndn-cxx InMemoryStorage because SVS can touch this path from sync callback
+  // and subscription delivery paths close together when parallel sync is enabled.
+  std::map<Name, Data> m_piggyDataCache;
+  std::deque<Name> m_piggyDataCacheOrder;
+  size_t m_piggyDataCacheLimit = 1024;
+  std::mutex m_extraDataMutex;
+
+  std::mutex m_asyncPublishMutex;
+  std::map<NodeID, SeqNo> m_reservedSeqNo;
+  std::deque<AsyncPublication> m_asyncPublishQueue;
+  std::map<NodeID, SeqNo> m_nextAsyncCommitSeq;
+  std::map<NodeID, std::map<SeqNo, PreparedPublication>> m_preparedPublications;
+
+  boost::asio::thread_pool m_asyncPublishWorkers;
+  std::shared_ptr<std::atomic_bool> m_asyncPublishAlive;
+  std::mutex m_asyncPublishSigningMutex;
 };
 
 } // namespace ndn::svs
