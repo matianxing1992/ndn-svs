@@ -22,6 +22,8 @@
 #include "security-options.hpp"
 #include "store.hpp"
 
+#include <mutex>
+
 namespace ndn::svs {
 
 /**
@@ -95,6 +97,29 @@ public:
                     uint32_t contentType = ndn::tlv::Content);
 
   /**
+   * @brief Publish a data packet with an already reserved sequence number.
+   *
+   * This is intended for non-blocking publishers that reserve seqNo before
+   * deferring actual publication to the Face/io_context thread.
+   */
+  void
+  publishDataAtSeq(const Block& content, const ndn::time::milliseconds& freshness,
+                   const NodeID& nid, const SeqNo seq,
+                   uint32_t contentType = ndn::tlv::Content);
+
+  /**
+   * @brief Insert a data packet with an already reserved sequence number
+   * without announcing the sequence number.
+   *
+   * Pub/Sub uses this to make mapping and piggyback metadata visible before
+   * the local state vector is advanced and the Sync Interest is sent.
+   */
+  void
+  insertDataAtSeq(const Block& content, const ndn::time::milliseconds& freshness,
+                  const NodeID& nid, const SeqNo seq,
+                  uint32_t contentType = ndn::tlv::Content);
+
+  /**
    * Insert segment into the store without changing the sequence number.
    * Intended for inserting segments of a large publication.
    *
@@ -112,6 +137,24 @@ public:
                          const size_t segNo,
                          const Name::Component& finalBlock,
                          uint32_t contentType = ndn::tlv::Content);
+
+  /**
+   * @brief Insert an already-built and signed outer SVS Data packet.
+   *
+   * This is used by parallel publishers that construct and sign Data packets on
+   * worker threads. The caller remains responsible for invoking updateSeqNo()
+   * on the Face/io_context thread after all related mapping state is ready.
+   */
+  void
+  insertPreparedData(const Data& data, bool putToFace = false);
+
+  /**
+   * @brief Put an already-prepared Data packet on the Face without touching the
+   * store. Used after worker-thread insertion to keep Face operations on the
+   * Face/io_context thread.
+   */
+  void
+  putPreparedData(const Data& data);
 
   /**
    * @brief Retrive a data packet with a particular seqNo from a session
@@ -204,6 +247,7 @@ private:
   const UpdateCallback m_onUpdate;
 
   std::shared_ptr<DataStore> m_dataStore;
+  std::mutex m_dataStoreMutex;
   SVSyncCore m_core;
 };
 

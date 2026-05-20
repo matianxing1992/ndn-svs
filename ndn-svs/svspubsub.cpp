@@ -18,10 +18,16 @@
 #include "tlv.hpp"
 
 #include <ndn-cxx/util/segment-fetcher.hpp>
+#include <ndn-cxx/util/logger.hpp>
+
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/post.hpp>
 
 #include <chrono>
 
 namespace ndn::svs {
+
+NDN_LOG_INIT(ndn_svs.SVSPubSub);
 
 SVSPubSub::SVSPubSub(const Name& syncPrefix,
                      const Name& nodePrefix,
@@ -42,10 +48,20 @@ SVSPubSub::SVSPubSub(const Name& syncPrefix,
              securityOptions,
              options.dataStore)
   , m_mappingProvider(syncPrefix, nodePrefix, face, securityOptions)
-  , m_piggyDataCache(1024)
+  , m_asyncPublishWorkers(4)
+  , m_asyncPublishAlive(std::make_shared<std::atomic_bool>(true))
 {
   m_svsync.getCore().setGetExtraBlockCallback(std::bind(&SVSPubSub::onGetExtraData, this, _1));
   m_svsync.getCore().setRecvExtraBlockCallback(std::bind(&SVSPubSub::onRecvExtraData, this, _1, _2));
+}
+
+SVSPubSub::~SVSPubSub()
+{
+  if (m_asyncPublishAlive) {
+    m_asyncPublishAlive->store(false, std::memory_order_relaxed);
+  }
+  m_asyncPublishWorkers.stop();
+  m_asyncPublishWorkers.join();
 }
 
 SeqNo
@@ -61,7 +77,7 @@ SVSPubSub::publish(const Name& name,
     auto finalBlock = name::Component::fromSegment(nSegments - 1);
 
     NodeID nid = nodePrefix == EMPTY_NAME ? m_dataPrefix : nodePrefix;
-    SeqNo seqNo = m_svsync.getCore().getSeqNo(nid) + 1;
+    SeqNo seqNo = reserveSeqNo(nid);
 
     for (size_t i = 0; i < nSegments; i++) {
       // Create encapsulated segment
@@ -91,10 +107,33 @@ SVSPubSub::publish(const Name& name,
     data.setFreshnessPeriod(freshnessPeriod);
     m_securityOptions.dataSigner->sign(data);
     // if the data size is smaller than MAX_SIZE_OF_PIGGYDATA, add it to the piggyback queue
-    if (data.wireEncode().size() <= MAX_SIZE_OF_PIGGYDATA)
+    if (data.wireEncode().size() <= MAX_SIZE_OF_PIGGYDATA) {
+      std::lock_guard<std::mutex> lock(m_extraDataMutex);
       m_piggyDataQueue.push(data);
+    }
     return publishPacket(data, nodePrefix);
   }
+}
+
+SeqNo
+SVSPubSub::publishAsync(const Name& name, span<const uint8_t> value,
+                        const Name& nodePrefix, time::milliseconds freshnessPeriod,
+                        std::vector<Block> mappingBlocks)
+{
+  NodeID nid = nodePrefix == EMPTY_NAME ? m_dataPrefix : nodePrefix;
+  SeqNo seqNo = reserveSeqNo(nid);
+
+  AsyncPublication publication;
+  publication.kind = AsyncPublication::Kind::Bytes;
+  publication.seqNo = seqNo;
+  publication.name = name;
+  publication.nodePrefix = nid;
+  publication.freshnessPeriod = freshnessPeriod;
+  publication.value.assign(value.begin(), value.end());
+  publication.mappingBlocks = std::move(mappingBlocks);
+  enqueueAsyncPublication(std::move(publication));
+
+  return seqNo;
 }
 
 
@@ -105,7 +144,7 @@ SVSPubSub::publish(const Name& name,
 {
   // Segment the data if larger than MAX_DATA_SIZE
   NodeID nid = nodePrefix == EMPTY_NAME ? m_dataPrefix : nodePrefix;
-  SeqNo seqNo = m_svsync.getCore().getSeqNo(nid) + 1;
+  SeqNo seqNo = reserveSeqNo(nid);
 
   // Insert mapping and manually update the sequence number
   insertMapping(nid, seqNo, name, mappingBlocks);
@@ -115,12 +154,300 @@ SVSPubSub::publish(const Name& name,
 }
 
 SeqNo
-SVSPubSub::publishPacket(const Data& data, const Name& nodePrefix, std::vector<Block> mappingBlocks)
+SVSPubSub::publishAsync(const Name& name,
+                        const Name& nodePrefix, time::milliseconds freshnessPeriod,
+                        std::vector<Block> mappingBlocks)
 {
   NodeID nid = nodePrefix == EMPTY_NAME ? m_dataPrefix : nodePrefix;
-  SeqNo seqNo = m_svsync.publishData(data.wireEncode(), data.getFreshnessPeriod(), nid, ndn::tlv::Data);
-  insertMapping(nid, seqNo, data.getName(), mappingBlocks);
+  SeqNo seqNo = reserveSeqNo(nid);
+
+  AsyncPublication publication;
+  publication.kind = AsyncPublication::Kind::NameOnly;
+  publication.seqNo = seqNo;
+  publication.name = name;
+  publication.nodePrefix = nid;
+  publication.freshnessPeriod = freshnessPeriod;
+  publication.mappingBlocks = std::move(mappingBlocks);
+  enqueueAsyncPublication(std::move(publication));
+
   return seqNo;
+}
+
+SeqNo
+SVSPubSub::publishPacket(const Data& data, const Name& nodePrefix,
+                         std::vector<Block> mappingBlocks)
+{
+  NodeID nid = nodePrefix == EMPTY_NAME ? m_dataPrefix : nodePrefix;
+  SeqNo seqNo = reserveSeqNo(nid);
+  m_svsync.insertDataAtSeq(data.wireEncode(), data.getFreshnessPeriod(),
+                           nid, seqNo, ndn::tlv::Data);
+  insertMapping(nid, seqNo, data.getName(), mappingBlocks);
+  m_svsync.getCore().updateSeqNo(seqNo, nid);
+  return seqNo;
+}
+
+SeqNo
+SVSPubSub::publishPacketAsync(const Data& data, const Name& nodePrefix,
+                              std::vector<Block> mappingBlocks)
+{
+  NodeID nid = nodePrefix == EMPTY_NAME ? m_dataPrefix : nodePrefix;
+  SeqNo seqNo = reserveSeqNo(nid);
+
+  AsyncPublication publication;
+  publication.kind = AsyncPublication::Kind::Packet;
+  publication.seqNo = seqNo;
+  publication.name = data.getName();
+  publication.nodePrefix = nid;
+  publication.freshnessPeriod = data.getFreshnessPeriod();
+  publication.packet = data;
+  publication.mappingBlocks = std::move(mappingBlocks);
+  enqueueAsyncPublication(std::move(publication));
+
+  return seqNo;
+}
+
+SeqNo
+SVSPubSub::reserveSeqNo(const NodeID& nid)
+{
+  std::lock_guard<std::mutex> lock(m_asyncPublishMutex);
+  SeqNo& reserved = m_reservedSeqNo[nid];
+  reserved = std::max(reserved, m_svsync.getCore().getSeqNo(nid));
+  SeqNo seqNo = ++reserved;
+  if (m_nextAsyncCommitSeq.find(nid) == m_nextAsyncCommitSeq.end()) {
+    m_nextAsyncCommitSeq[nid] = seqNo;
+  }
+  return seqNo;
+}
+
+void
+SVSPubSub::enqueueAsyncPublication(AsyncPublication publication)
+{
+  auto alive = m_asyncPublishAlive;
+  boost::asio::post(m_asyncPublishWorkers,
+                    [this, alive, publication = std::move(publication)] () mutable {
+                      if (!alive || !alive->load(std::memory_order_relaxed)) {
+                        return;
+                      }
+                      prepareAsyncPublication(std::move(publication));
+                    });
+}
+
+void
+SVSPubSub::prepareAsyncPublication(AsyncPublication publication)
+{
+  PreparedPublication prepared;
+  try {
+    switch (publication.kind) {
+      case AsyncPublication::Kind::Bytes:
+        prepared = prepareReservedBytes(publication);
+        break;
+      case AsyncPublication::Kind::NameOnly:
+        prepared = prepareReservedNameOnly(publication);
+        break;
+      case AsyncPublication::Kind::Packet:
+        prepared = prepareReservedPacket(publication);
+        break;
+    }
+  }
+  catch (const std::exception& e) {
+    NDN_LOG_DEBUG("event=async_publish_prepare_failed node=" << publication.nodePrefix
+                  << " seq=" << publication.seqNo << " error=" << e.what());
+    prepared.seqNo = publication.seqNo;
+    prepared.nodePrefix = publication.nodePrefix;
+    prepared.ok = false;
+  }
+
+  auto alive = m_asyncPublishAlive;
+  boost::asio::post(m_face.getIoContext(), [this, alive, prepared = std::move(prepared)] () mutable {
+    if (!alive || !alive->load(std::memory_order_relaxed)) {
+      return;
+    }
+    onPreparedPublication(std::move(prepared));
+  });
+}
+
+SVSPubSub::PreparedPublication
+SVSPubSub::prepareReservedBytes(const AsyncPublication& publication)
+{
+  PreparedPublication prepared;
+  prepared.seqNo = publication.seqNo;
+  prepared.nodePrefix = publication.nodePrefix;
+  prepared.mappingName = publication.name;
+  prepared.freshnessPeriod = publication.freshnessPeriod;
+  prepared.mappingBlocks = publication.mappingBlocks;
+
+  if (publication.value.size() > MAX_DATA_SIZE) {
+    size_t nSegments = (publication.value.size() / MAX_DATA_SIZE) + 1;
+    auto finalBlock = name::Component::fromSegment(nSegments - 1);
+
+    for (size_t i = 0; i < nSegments; i++)
+    {
+      auto segmentName = Name(publication.name).appendVersion(0).appendSegment(i);
+      auto segment = Data(segmentName);
+      segment.setFreshnessPeriod(publication.freshnessPeriod);
+
+      const uint8_t* segVal = publication.value.data() + i * MAX_DATA_SIZE;
+      const size_t segValSize = std::min(publication.value.size() - i * MAX_DATA_SIZE,
+                                         MAX_DATA_SIZE);
+      segment.setContent(ndn::make_span(segVal, segValSize));
+
+      segment.setFinalBlock(finalBlock);
+      {
+        std::lock_guard<std::mutex> lock(m_asyncPublishSigningMutex);
+        m_securityOptions.dataSigner->sign(segment);
+      }
+
+      Data outer(m_svsync.getDataName(publication.nodePrefix, publication.seqNo)
+                   .appendVersion(0).appendSegment(i));
+      outer.setContent(segment.wireEncode());
+      outer.setFreshnessPeriod(publication.freshnessPeriod);
+      outer.setContentType(ndn::tlv::Data);
+      outer.setFinalBlock(finalBlock);
+      {
+        std::lock_guard<std::mutex> lock(m_asyncPublishSigningMutex);
+        m_securityOptions.dataSigner->sign(outer);
+      }
+      outer.wireEncode();
+      m_svsync.insertPreparedData(outer, false);
+      prepared.outerPackets.push_back(std::move(outer));
+    }
+
+    insertMapping(publication.nodePrefix, publication.seqNo,
+                  publication.name, publication.mappingBlocks);
+    return prepared;
+  }
+
+  ndn::Data data(publication.name);
+  data.setContent(make_span(publication.value.data(), publication.value.size()));
+  data.setFreshnessPeriod(publication.freshnessPeriod);
+  {
+    std::lock_guard<std::mutex> lock(m_asyncPublishSigningMutex);
+    m_securityOptions.dataSigner->sign(data);
+  }
+  if (data.wireEncode().size() <= MAX_SIZE_OF_PIGGYDATA) {
+    prepared.piggyPacket = data;
+  }
+
+  AsyncPublication packetPublication;
+  packetPublication.kind = AsyncPublication::Kind::Packet;
+  packetPublication.seqNo = publication.seqNo;
+  packetPublication.name = data.getName();
+  packetPublication.nodePrefix = publication.nodePrefix;
+  packetPublication.freshnessPeriod = data.getFreshnessPeriod();
+  packetPublication.packet = data;
+  packetPublication.mappingBlocks = publication.mappingBlocks;
+  auto packetPrepared = prepareReservedPacket(packetPublication);
+  packetPrepared.piggyPacket = prepared.piggyPacket;
+  return packetPrepared;
+}
+
+SVSPubSub::PreparedPublication
+SVSPubSub::prepareReservedNameOnly(const AsyncPublication& publication)
+{
+  PreparedPublication prepared;
+  prepared.seqNo = publication.seqNo;
+  prepared.nodePrefix = publication.nodePrefix;
+  prepared.mappingName = publication.name;
+  prepared.freshnessPeriod = publication.freshnessPeriod;
+  prepared.mappingBlocks = publication.mappingBlocks;
+  insertMapping(publication.nodePrefix, publication.seqNo,
+                publication.name, publication.mappingBlocks);
+  return prepared;
+}
+
+SVSPubSub::PreparedPublication
+SVSPubSub::prepareReservedPacket(const AsyncPublication& publication)
+{
+  PreparedPublication prepared;
+  prepared.seqNo = publication.seqNo;
+  prepared.nodePrefix = publication.nodePrefix;
+  prepared.mappingName = publication.packet.getName();
+  prepared.freshnessPeriod = publication.packet.getFreshnessPeriod();
+  prepared.mappingBlocks = publication.mappingBlocks;
+  prepared.putFirstPacketToFace = true;
+
+  Data outer(m_svsync.getDataName(publication.nodePrefix, publication.seqNo));
+  outer.setContent(publication.packet.wireEncode());
+  outer.setFreshnessPeriod(publication.packet.getFreshnessPeriod());
+  outer.setContentType(ndn::tlv::Data);
+  {
+    std::lock_guard<std::mutex> lock(m_asyncPublishSigningMutex);
+    m_securityOptions.dataSigner->sign(outer);
+  }
+  outer.wireEncode();
+  m_svsync.insertPreparedData(outer, false);
+  prepared.outerPackets.push_back(std::move(outer));
+  insertMapping(publication.nodePrefix, publication.seqNo,
+                publication.packet.getName(), publication.mappingBlocks);
+  return prepared;
+}
+
+void
+SVSPubSub::onPreparedPublication(PreparedPublication publication)
+{
+  const auto nodePrefix = publication.nodePrefix;
+  {
+    std::lock_guard<std::mutex> lock(m_asyncPublishMutex);
+    m_preparedPublications[nodePrefix][publication.seqNo] = std::move(publication);
+  }
+  commitReadyPreparedPublications(nodePrefix);
+}
+
+void
+SVSPubSub::commitReadyPreparedPublications(const NodeID& nid)
+{
+  std::vector<PreparedPublication> ready;
+  SeqNo highestSeq = 0;
+  while (true) {
+    {
+      std::lock_guard<std::mutex> lock(m_asyncPublishMutex);
+      auto nextIt = m_nextAsyncCommitSeq.find(nid);
+      if (nextIt == m_nextAsyncCommitSeq.end()) {
+        break;
+      }
+      auto nodeIt = m_preparedPublications.find(nid);
+      if (nodeIt == m_preparedPublications.end()) {
+        break;
+      }
+      auto pubIt = nodeIt->second.find(nextIt->second);
+      if (pubIt == nodeIt->second.end()) {
+        break;
+      }
+      highestSeq = pubIt->second.seqNo;
+      ready.push_back(std::move(pubIt->second));
+      nodeIt->second.erase(pubIt);
+      if (nodeIt->second.empty()) {
+        m_preparedPublications.erase(nodeIt);
+      }
+      ++nextIt->second;
+    }
+  }
+
+  if (ready.empty()) {
+    return;
+  }
+
+  for (const auto& publication : ready) {
+    commitPreparedPublication(publication);
+  }
+  m_svsync.getCore().updateSeqNo(highestSeq, nid);
+}
+
+void
+SVSPubSub::commitPreparedPublication(const PreparedPublication& publication)
+{
+  if (!publication.ok) {
+    return;
+  }
+
+  if (publication.putFirstPacketToFace && !publication.outerPackets.empty()) {
+    m_svsync.putPreparedData(publication.outerPackets.front());
+  }
+
+  if (publication.piggyPacket) {
+    std::lock_guard<std::mutex> lock(m_extraDataMutex);
+    m_piggyDataQueue.push(*publication.piggyPacket);
+  }
 }
 
 void
@@ -142,9 +469,12 @@ SVSPubSub::insertMapping(const NodeID& nid, SeqNo seqNo, const Name& name, std::
   MappingEntryPair entry = { name, additional };
 
   // notify subscribers in next sync interest
-  if (m_notificationMappingList.nodeId == EMPTY_NAME || m_notificationMappingList.nodeId == nid) {
-    m_notificationMappingList.nodeId = nid;
-    m_notificationMappingList.pairs.push_back({ seqNo, entry });
+  {
+    std::lock_guard<std::mutex> lock(m_extraDataMutex);
+    if (m_notificationMappingList.nodeId == EMPTY_NAME || m_notificationMappingList.nodeId == nid) {
+      m_notificationMappingList.nodeId = nid;
+      m_notificationMappingList.pairs.push_back({ seqNo, entry });
+    }
   }
 
   // send mapping to provider
@@ -292,12 +622,19 @@ SVSPubSub::processMapping(const NodeID& nodeId, SeqNo seqNo)
   bool queued = false;
   auto queueOrDeliver = [this, &queued, &mapping, &nodeId, seqNo](const Subscription& sub) {
     if (sub.autofetch) {
-      auto data = m_piggyDataCache.find(mapping.first);
-      if (data != nullptr) {
-        std::optional<Data> packet = *data;
+      std::optional<Data> packet;
+      {
+        std::lock_guard<std::mutex> lock(m_extraDataMutex);
+        auto data = m_piggyDataCache.lower_bound(mapping.first);
+        if (data != m_piggyDataCache.end() &&
+            mapping.first.isPrefixOf(data->first)) {
+          packet = data->second;
+        }
+      }
+      if (packet) {
         SubscriptionData subData = {
           mapping.first,
-          data->getContent().value_bytes(),
+          packet->getContent().value_bytes(),
           nodeId,
           seqNo,
           packet
@@ -524,15 +861,36 @@ SVSPubSub::satisfyPendingFetchFromPiggyData(const Data& data)
     cleanUpFetch(publication);
   }
 
+  NDN_LOG_TRACE("event=piggyback_satisfy data=" << data.getName()
+                << " matches=" << ready.size());
+
   return !ready.empty();
 }
 
 Block
 SVSPubSub::onGetExtraData(const VersionVector&)
 {
-  MappingList copy = m_notificationMappingList;
-  ndn::Block block = copy.encode();
+  std::lock_guard<std::mutex> lock(m_extraDataMutex);
 
+  MappingList includedMappings(m_notificationMappingList.nodeId);
+  size_t mappingCount = 0;
+  size_t piggyCount = 0;
+  if (m_notificationMappingList.nodeId != EMPTY_NAME) {
+    for (const auto& entry : m_notificationMappingList.pairs) {
+      MappingList candidate = includedMappings;
+      candidate.pairs.push_back(entry);
+      auto candidateBlock = candidate.encode();
+      if (candidateBlock.size() <= MAX_SIZE_OF_APPLICATION_PARAMETERS) {
+        includedMappings = std::move(candidate);
+        ++mappingCount;
+      }
+      // Overflow mappings are intentionally omitted from this latency-oriented
+      // piggyback path; peers can still fetch them from MappingProvider.
+    }
+  }
+
+  ndn::Block block = includedMappings.encode();
+  block.parse();
   size_t size = block.size();
   while (!m_piggyDataQueue.empty()) {
     const auto& data = m_piggyDataQueue.front();
@@ -544,8 +902,13 @@ SVSPubSub::onGetExtraData(const VersionVector&)
     block.push_back(dataBlock);
     size += dataBlock.size();
     m_piggyDataQueue.pop();
+    ++piggyCount;
   }
   block.encode();
+
+  NDN_LOG_TRACE("event=piggyback_build mappings=" << mappingCount
+                << " data=" << piggyCount
+                << " bytes=" << block.size());
 
   m_notificationMappingList = MappingList();
   std::queue<ndn::Data> empty;
@@ -558,26 +921,56 @@ void
 SVSPubSub::onRecvExtraData(const Block& block, const VersionVector&)
 {
   try {
+    NDN_LOG_TRACE("event=piggyback_recv_block type=" << block.type()
+                  << " bytes=" << block.size());
     MappingList list(block);
     for (const auto& p : list.pairs) {
       m_mappingProvider.insertMapping(list.nodeId, p.first, p.second);
     }
+    NDN_LOG_TRACE("event=piggyback_recv_mapping_list node=" << list.nodeId
+                  << " mappings=" << list.pairs.size());
+  } catch (const std::exception& e) {
+    NDN_LOG_TRACE("event=piggyback_recv_mapping_list_error error=" << e.what());
+  }
 
+  try {
     block.parse();
+    size_t mappingCount = 0;
+    size_t dataCount = 0;
     for (const auto& childBlock : block.elements()) {
+      NDN_LOG_TRACE("event=piggyback_recv_child type=" << childBlock.type()
+                    << " bytes=" << childBlock.size());
       if (childBlock.type() == ndn::svs::tlv::MappingData) {
         MappingList childList(childBlock);
         for (const auto& p : childList.pairs) {
           m_mappingProvider.insertMapping(childList.nodeId, p.first, p.second);
         }
+        mappingCount += childList.pairs.size();
       }
 
       if (childBlock.type() == ndn::tlv::Data) {
         ndn::Data data(childBlock);
-        m_piggyDataCache.insert(data);
         satisfyPendingFetchFromPiggyData(data);
+        try {
+          std::lock_guard<std::mutex> lock(m_extraDataMutex);
+          const auto fullName = data.getFullName();
+          if (m_piggyDataCache.find(fullName) == m_piggyDataCache.end()) {
+            m_piggyDataCacheOrder.push_back(fullName);
+          }
+          m_piggyDataCache[fullName] = data;
+          while (m_piggyDataCache.size() > m_piggyDataCacheLimit &&
+                 !m_piggyDataCacheOrder.empty()) {
+            m_piggyDataCache.erase(m_piggyDataCacheOrder.front());
+            m_piggyDataCacheOrder.pop_front();
+          }
+        }
+        catch (const std::exception&) {
+        }
+        ++dataCount;
       }
     }
+    NDN_LOG_TRACE("event=piggyback_recv_children mappings=" << mappingCount
+                  << " data=" << dataCount);
   } catch (const std::exception&) {
   }
 }
