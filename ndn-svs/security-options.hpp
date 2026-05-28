@@ -19,6 +19,8 @@
 
 #include "common.hpp"
 
+#include <mutex>
+
 namespace ndn::svs {
 
 /**
@@ -86,7 +88,12 @@ public:
   void sign(Data& data) const override;
 
 private:
+  time::system_clock::time_point getFreshInterestTimestamp() const;
+
+private:
   KeyChain& m_keyChain;
+  mutable std::mutex m_interestTimestampMutex;
+  mutable time::system_clock::time_point m_lastInterestTimestamp;
 };
 
 /**
