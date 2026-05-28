@@ -25,13 +25,36 @@ BaseSigner::~BaseSigner() = default;
 void
 KeyChainSigner::sign(Interest& interest) const
 {
-  m_keyChain.sign(interest, signingInfo);
+  auto params = signingInfo;
+  auto sigInfo = params.getSignatureInfo();
+  sigInfo.setTime(getFreshInterestTimestamp());
+  params.setSignatureInfo(sigInfo);
+  params.setSignedInterestFormat(security::SignedInterestFormat::V03);
+  m_keyChain.sign(interest, params);
 }
 
 void
 KeyChainSigner::sign(Data& data) const
 {
   m_keyChain.sign(data, signingInfo);
+}
+
+time::system_clock::time_point
+KeyChainSigner::getFreshInterestTimestamp() const
+{
+  std::lock_guard<std::mutex> lock(m_interestTimestampMutex);
+
+  auto timestamp = time::system_clock::now();
+  if (time::duration_cast<time::milliseconds>(timestamp - m_lastInterestTimestamp) >
+      time::milliseconds(0)) {
+    m_lastInterestTimestamp = timestamp;
+  }
+  else {
+    m_lastInterestTimestamp += time::milliseconds(1);
+    timestamp = m_lastInterestTimestamp;
+  }
+
+  return timestamp;
 }
 
 SecurityOptions::SecurityOptions(KeyChain& keyChain)
