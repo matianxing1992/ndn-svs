@@ -27,6 +27,7 @@
 #include <boost/asio/post.hpp>
 
 #include <chrono>
+#include <cmath>
 
 #ifdef NDN_SVS_COMPRESSION
 #include <boost/iostreams/copy.hpp>
@@ -336,6 +337,31 @@ SVSyncCore::setMaxSuppressionTime(time::milliseconds delay)
   std::lock_guard<std::mutex> lock(m_schedulerMutex);
   m_maxSuppressionTime = delay;
   m_intrReplyDist = std::uniform_int_distribution<>(0, m_maxSuppressionTime.count());
+}
+
+void
+SVSyncCore::setPeriodicSyncTime(time::milliseconds interval, double jitter)
+{
+  if (interval < 1_ms) {
+    interval = 1_ms;
+  }
+  if (jitter < 0.0) {
+    jitter = 0.0;
+  }
+  if (jitter > 1.0) {
+    jitter = 1.0;
+  }
+
+  std::lock_guard<std::mutex> lock(m_schedulerMutex);
+  m_periodicSyncTime = interval;
+  m_periodicSyncJitter = jitter;
+  const auto lower = static_cast<int>(
+    std::max<int64_t>(1, static_cast<int64_t>(
+      std::llround(m_periodicSyncTime.count() * (1.0 - m_periodicSyncJitter)))));
+  const auto upper = static_cast<int>(
+    std::max<int64_t>(lower, static_cast<int64_t>(
+      std::llround(m_periodicSyncTime.count() * (1.0 + m_periodicSyncJitter)))));
+  m_retxDist = std::uniform_int_distribution<>(lower, upper);
 }
 
 SVSyncCore::SyncProcessingStats

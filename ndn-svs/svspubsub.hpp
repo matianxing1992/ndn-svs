@@ -256,6 +256,12 @@ NDN_SVS_PUBLIC_WITH_TESTS_ELSE_PRIVATE:
   bool
   satisfyPendingFetchFromPiggyData(const Data& data);
 
+  bool
+  hasPiggyDeliveredPublication(const std::pair<Name, SeqNo>& publication);
+
+  void
+  rememberPiggyDeliveredPublication(const std::pair<Name, SeqNo>& publication);
+
   /// @brief Insert a mapping entry into the store
   void insertMapping(const NodeID& nid, SeqNo seqNo, const Name& name, std::vector<Block> additional);
 
@@ -303,6 +309,12 @@ NDN_SVS_PUBLIC_WITH_TESTS_ELSE_PRIVATE:
     std::vector<Block> mappingBlocks;
     bool putFirstPacketToFace = false;
     bool ok = true;
+  };
+
+  struct PiggyDataEntry
+  {
+    Data data;
+    size_t missed = 0;
   };
 
   void
@@ -364,14 +376,18 @@ private:
 
   size_t MAX_SIZE_OF_APPLICATION_PARAMETERS = 4096;
   size_t MAX_SIZE_OF_PIGGYDATA = 800;
-  // Queue of Pending Piggy Data (to be sent in the next update with sync interest) : First in first out
-  std::queue<ndn::Data> m_piggyDataQueue;
+  // Pending piggyback Data. Newer entries are tried first; entries that miss
+  // several Sync Interest opportunities are dropped and peers fetch normally.
+  std::deque<PiggyDataEntry> m_piggyDataQueue;
   // A bounded cache for received piggyback Data. This intentionally avoids
   // ndn-cxx InMemoryStorage because SVS can touch this path from sync callback
   // and subscription delivery paths close together when parallel sync is enabled.
   std::map<Name, Data> m_piggyDataCache;
   std::deque<Name> m_piggyDataCacheOrder;
   size_t m_piggyDataCacheLimit = 1024;
+  std::map<std::pair<Name, SeqNo>, bool> m_piggyDeliveredPublications;
+  std::deque<std::pair<Name, SeqNo>> m_piggyDeliveredPublicationOrder;
+  size_t m_piggyDeliveredPublicationLimit = 4096;
   std::mutex m_extraDataMutex;
 
   std::mutex m_asyncPublishMutex;
