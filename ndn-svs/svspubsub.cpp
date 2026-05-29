@@ -23,11 +23,32 @@
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/post.hpp>
 
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
 
 namespace ndn::svs {
 
 NDN_LOG_INIT(ndn_svs.SVSPubSub);
+
+namespace {
+
+size_t
+envSizeOrDefault(const char* name, size_t defaultValue)
+{
+  const char* value = std::getenv(name);
+  if (value == nullptr || *value == '\0') {
+    return defaultValue;
+  }
+  try {
+    return std::max<size_t>(1, static_cast<size_t>(std::stoull(value)));
+  }
+  catch (...) {
+    return defaultValue;
+  }
+}
+
+} // namespace
 
 SVSPubSub::SVSPubSub(const Name& syncPrefix,
                      const Name& nodePrefix,
@@ -51,6 +72,15 @@ SVSPubSub::SVSPubSub(const Name& syncPrefix,
   , m_asyncPublishWorkers(4)
   , m_asyncPublishAlive(std::make_shared<std::atomic_bool>(true))
 {
+  MAX_SIZE_OF_APPLICATION_PARAMETERS =
+    envSizeOrDefault("NDNSF_SVS_MAX_APP_PARAMS_BYTES",
+                     MAX_SIZE_OF_APPLICATION_PARAMETERS);
+  MAX_SIZE_OF_PIGGYDATA =
+    envSizeOrDefault("NDNSF_SVS_MAX_PIGGYDATA_BYTES",
+                     MAX_SIZE_OF_PIGGYDATA);
+  m_piggyDataCacheLimit =
+    envSizeOrDefault("NDNSF_SVS_PIGGYDATA_CACHE_LIMIT",
+                     m_piggyDataCacheLimit);
   m_svsync.getCore().setGetExtraBlockCallback(std::bind(&SVSPubSub::onGetExtraData, this, _1));
   m_svsync.getCore().setRecvExtraBlockCallback(std::bind(&SVSPubSub::onRecvExtraData, this, _1, _2));
 }
@@ -107,9 +137,15 @@ SVSPubSub::publish(const Name& name,
     data.setFreshnessPeriod(freshnessPeriod);
     m_securityOptions.dataSigner->sign(data);
     // if the data size is smaller than MAX_SIZE_OF_PIGGYDATA, add it to the piggyback queue
-    if (data.wireEncode().size() <= MAX_SIZE_OF_PIGGYDATA) {
+    const auto wireSize = data.wireEncode().size();
+    if (wireSize <= MAX_SIZE_OF_PIGGYDATA) {
       std::lock_guard<std::mutex> lock(m_extraDataMutex);
-      m_piggyDataQueue.push(data);
+      m_piggyDataQueue.push_back({data, 0});
+    }
+    else {
+      NDN_LOG_TRACE("event=piggyback_skip reason=data_too_large bytes=" << wireSize
+                    << " limit=" << MAX_SIZE_OF_PIGGYDATA
+                    << " data=" << data.getName());
     }
     return publishPacket(data, nodePrefix);
   }
@@ -324,8 +360,14 @@ SVSPubSub::prepareReservedBytes(const AsyncPublication& publication)
     std::lock_guard<std::mutex> lock(m_asyncPublishSigningMutex);
     m_securityOptions.dataSigner->sign(data);
   }
-  if (data.wireEncode().size() <= MAX_SIZE_OF_PIGGYDATA) {
+  const auto wireSize = data.wireEncode().size();
+  if (wireSize <= MAX_SIZE_OF_PIGGYDATA) {
     prepared.piggyPacket = data;
+  }
+  else {
+    NDN_LOG_TRACE("event=piggyback_skip reason=data_too_large bytes=" << wireSize
+                  << " limit=" << MAX_SIZE_OF_PIGGYDATA
+                  << " data=" << data.getName());
   }
 
   AsyncPublication packetPublication;
@@ -446,7 +488,7 @@ SVSPubSub::commitPreparedPublication(const PreparedPublication& publication)
 
   if (publication.piggyPacket) {
     std::lock_guard<std::mutex> lock(m_extraDataMutex);
-    m_piggyDataQueue.push(*publication.piggyPacket);
+    m_piggyDataQueue.push_back({*publication.piggyPacket, 0});
   }
 }
 
@@ -596,6 +638,11 @@ SVSPubSub::updateCallbackInternal(const std::vector<MissingDataInfo>& info)
 bool
 SVSPubSub::processMapping(const NodeID& nodeId, SeqNo seqNo)
 {
+  const std::pair<Name, SeqNo> publication(nodeId, seqNo);
+  if (hasPiggyDeliveredPublication(publication)) {
+    return false;
+  }
+
   // this will throw if mapping not found
   auto mapping = m_mappingProvider.getMapping(nodeId, seqNo);
 
@@ -620,13 +667,19 @@ SVSPubSub::processMapping(const NodeID& nodeId, SeqNo seqNo)
   }
 
   bool queued = false;
-  auto queueOrDeliver = [this, &queued, &mapping, &nodeId, seqNo](const Subscription& sub) {
+  bool deliveredFromPiggy = false;
+  auto queueOrDeliver = [this, &queued, &deliveredFromPiggy, &mapping, &publication,
+                         &nodeId, seqNo](const Subscription& sub) {
     if (sub.autofetch) {
       std::optional<Data> packet;
       {
         std::lock_guard<std::mutex> lock(m_extraDataMutex);
         auto data = m_piggyDataCache.lower_bound(mapping.first);
-        if (data != m_piggyDataCache.end() &&
+        auto exactData = m_piggyDataCache.find(mapping.first);
+        if (exactData != m_piggyDataCache.end()) {
+          packet = exactData->second;
+        }
+        else if (data != m_piggyDataCache.end() &&
             mapping.first.isPrefixOf(data->first)) {
           packet = data->second;
         }
@@ -640,9 +693,10 @@ SVSPubSub::processMapping(const NodeID& nodeId, SeqNo seqNo)
           packet
         };
         sub.callback(subData);
+        deliveredFromPiggy = true;
       }
       else {
-        m_fetchMap[std::pair(nodeId, seqNo)].push_back(sub);
+        m_fetchMap[publication].push_back(sub);
         queued = true;
       }
     }
@@ -670,6 +724,10 @@ SVSPubSub::processMapping(const NodeID& nodeId, SeqNo seqNo)
     }
   }
 
+  if (deliveredFromPiggy) {
+    rememberPiggyDeliveredPublication(publication);
+  }
+
   return queued;
 }
 
@@ -685,6 +743,42 @@ SVSPubSub::fetchAll()
 
     // Fetch first data packet
     const auto& [nodeId, seqNo] = key;
+    try {
+      const auto mapping = m_mappingProvider.getMapping(nodeId, seqNo);
+      std::optional<Data> packet;
+      {
+        std::lock_guard<std::mutex> lock(m_extraDataMutex);
+        auto data = m_piggyDataCache.lower_bound(mapping.first);
+        auto exactData = m_piggyDataCache.find(mapping.first);
+        if (exactData != m_piggyDataCache.end()) {
+          packet = exactData->second;
+        }
+        else if (data != m_piggyDataCache.end() &&
+            mapping.first.isPrefixOf(data->first)) {
+          packet = data->second;
+        }
+      }
+      if (packet) {
+        SubscriptionData subData = {
+          mapping.first,
+          packet->getContent().value_bytes(),
+          nodeId,
+          seqNo,
+          packet,
+        };
+        for (const auto& sub : m_fetchMap[key]) {
+          sub.callback(subData);
+        }
+        rememberPiggyDeliveredPublication(key);
+        NDN_LOG_TRACE("event=piggyback_cache_satisfy data=" << packet->getName()
+                      << " node=" << nodeId
+                      << " seq=" << seqNo);
+        cleanUpFetch(key);
+        continue;
+      }
+    }
+    catch (const std::exception&) {
+    }
     m_svsync.fetchData(nodeId, seqNo, std::bind(&SVSPubSub::onSyncData, this, _1, key), 12);
   }
 }
@@ -827,6 +921,28 @@ SVSPubSub::cleanUpFetch(const std::pair<Name, SeqNo>& publication)
 }
 
 bool
+SVSPubSub::hasPiggyDeliveredPublication(const std::pair<Name, SeqNo>& publication)
+{
+  std::lock_guard<std::mutex> lock(m_extraDataMutex);
+  return m_piggyDeliveredPublications.find(publication) != m_piggyDeliveredPublications.end();
+}
+
+void
+SVSPubSub::rememberPiggyDeliveredPublication(const std::pair<Name, SeqNo>& publication)
+{
+  std::lock_guard<std::mutex> lock(m_extraDataMutex);
+  if (m_piggyDeliveredPublications.find(publication) == m_piggyDeliveredPublications.end()) {
+    m_piggyDeliveredPublicationOrder.push_back(publication);
+  }
+  m_piggyDeliveredPublications[publication] = true;
+  while (m_piggyDeliveredPublications.size() > m_piggyDeliveredPublicationLimit &&
+         !m_piggyDeliveredPublicationOrder.empty()) {
+    m_piggyDeliveredPublications.erase(m_piggyDeliveredPublicationOrder.front());
+    m_piggyDeliveredPublicationOrder.pop_front();
+  }
+}
+
+bool
 SVSPubSub::satisfyPendingFetchFromPiggyData(const Data& data)
 {
   std::vector<std::pair<std::pair<Name, SeqNo>, std::vector<Subscription>>> ready;
@@ -858,6 +974,7 @@ SVSPubSub::satisfyPendingFetchFromPiggyData(const Data& data)
     for (const auto& sub : subscriptions) {
       sub.callback(subData);
     }
+    rememberPiggyDeliveredPublication(publication);
     cleanUpFetch(publication);
   }
 
@@ -892,27 +1009,42 @@ SVSPubSub::onGetExtraData(const VersionVector&)
   ndn::Block block = includedMappings.encode();
   block.parse();
   size_t size = block.size();
-  while (!m_piggyDataQueue.empty()) {
-    const auto& data = m_piggyDataQueue.front();
-    auto dataBlock = data.wireEncode();
+  size_t retainedCount = 0;
+  size_t expiredCount = 0;
+  std::deque<PiggyDataEntry> retained;
+  for (auto it = m_piggyDataQueue.rbegin(); it != m_piggyDataQueue.rend(); ++it) {
+    auto dataBlock = it->data.wireEncode();
     if (size + dataBlock.size() > MAX_SIZE_OF_APPLICATION_PARAMETERS) {
-      break;
+      ++it->missed;
+      if (it->missed < 3) {
+        retained.push_front(*it);
+        ++retainedCount;
+      }
+      else {
+        ++expiredCount;
+        NDN_LOG_TRACE("event=piggyback_drop reason=missed_too_many bytes="
+                      << dataBlock.size()
+                      << " data=" << it->data.getName());
+      }
+      continue;
     }
 
     block.push_back(dataBlock);
     size += dataBlock.size();
-    m_piggyDataQueue.pop();
     ++piggyCount;
   }
+  m_piggyDataQueue = std::move(retained);
   block.encode();
 
   NDN_LOG_TRACE("event=piggyback_build mappings=" << mappingCount
                 << " data=" << piggyCount
-                << " bytes=" << block.size());
+                << " retained=" << retainedCount
+                << " expired=" << expiredCount
+                << " bytes=" << block.size()
+                << " appParamLimit=" << MAX_SIZE_OF_APPLICATION_PARAMETERS
+                << " piggyDataLimit=" << MAX_SIZE_OF_PIGGYDATA);
 
   m_notificationMappingList = MappingList();
-  std::queue<ndn::Data> empty;
-  std::swap(m_piggyDataQueue, empty);
 
   return block;
 }
@@ -920,12 +1052,14 @@ SVSPubSub::onGetExtraData(const VersionVector&)
 void
 SVSPubSub::onRecvExtraData(const Block& block, const VersionVector&)
 {
+  std::vector<std::pair<NodeID, SeqNo>> receivedMappings;
   try {
     NDN_LOG_TRACE("event=piggyback_recv_block type=" << block.type()
                   << " bytes=" << block.size());
     MappingList list(block);
     for (const auto& p : list.pairs) {
       m_mappingProvider.insertMapping(list.nodeId, p.first, p.second);
+      receivedMappings.emplace_back(list.nodeId, p.first);
     }
     NDN_LOG_TRACE("event=piggyback_recv_mapping_list node=" << list.nodeId
                   << " mappings=" << list.pairs.size());
@@ -944,6 +1078,7 @@ SVSPubSub::onRecvExtraData(const Block& block, const VersionVector&)
         MappingList childList(childBlock);
         for (const auto& p : childList.pairs) {
           m_mappingProvider.insertMapping(childList.nodeId, p.first, p.second);
+          receivedMappings.emplace_back(childList.nodeId, p.first);
         }
         mappingCount += childList.pairs.size();
       }
@@ -953,6 +1088,11 @@ SVSPubSub::onRecvExtraData(const Block& block, const VersionVector&)
         satisfyPendingFetchFromPiggyData(data);
         try {
           std::lock_guard<std::mutex> lock(m_extraDataMutex);
+          const auto dataName = data.getName();
+          if (m_piggyDataCache.find(dataName) == m_piggyDataCache.end()) {
+            m_piggyDataCacheOrder.push_back(dataName);
+          }
+          m_piggyDataCache[dataName] = data;
           const auto fullName = data.getFullName();
           if (m_piggyDataCache.find(fullName) == m_piggyDataCache.end()) {
             m_piggyDataCacheOrder.push_back(fullName);
@@ -972,6 +1112,25 @@ SVSPubSub::onRecvExtraData(const Block& block, const VersionVector&)
     NDN_LOG_TRACE("event=piggyback_recv_children mappings=" << mappingCount
                   << " data=" << dataCount);
   } catch (const std::exception&) {
+  }
+
+  bool queued = false;
+  size_t processed = 0;
+  for (const auto& [nodeId, seqNo] : receivedMappings) {
+    try {
+      queued |= processMapping(nodeId, seqNo);
+      ++processed;
+    }
+    catch (const std::exception&) {
+    }
+  }
+  if (queued) {
+    fetchAll();
+  }
+  if (!receivedMappings.empty()) {
+    NDN_LOG_TRACE("event=piggyback_process_mappings processed=" << processed
+                  << " received=" << receivedMappings.size()
+                  << " queued=" << queued);
   }
 }
 

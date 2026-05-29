@@ -137,6 +137,17 @@ public:
   void
   setMaxSuppressionTime(time::milliseconds delay);
 
+  /**
+   * @brief Set the periodic Sync Interest retransmission interval.
+   *
+   * This is a diagnostic/testing override. Production and benchmark runs should
+   * normally keep the library default because this timer affects piggyback
+   * opportunities. Values below 1 ms are clamped to 1 ms.
+   */
+  void
+  setPeriodicSyncTime(time::milliseconds interval,
+                      double jitter = 0.1);
+
   SyncProcessingStats
   getSyncProcessingStats() const;
 
