@@ -55,6 +55,14 @@ elapsedUs(const SteadyClock::time_point& start, const SteadyClock::time_point& e
   return std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 }
 
+static BootstrapTime
+getCurrentBootstrapTime()
+{
+  return static_cast<BootstrapTime>(
+    std::chrono::duration_cast<std::chrono::seconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
 static std::string
 syncTraceKey(const Interest& interest)
 {
@@ -237,6 +245,7 @@ SVSyncCore::SVSyncCore(ndn::Face& face,
   , m_syncPrefix(syncPrefix)
   , m_securityOptions(securityOptions)
   , m_id(nid)
+  , m_bootstrapTime(getCurrentBootstrapTime())
   , m_onUpdate(onUpdate)
   , m_maxSuppressionTime(500_ms)
   , m_periodicSyncTime(30_s)
@@ -1126,25 +1135,28 @@ SVSyncCore::computeMergeStateVector(const VersionVector& localVector,
   MergeComputationResult result;
   result.mergedVector = localVector;
 
-  for (const auto& entry : remoteVector) {
-    const NodeID& nidOther = entry.first;
-    SeqNo seqOther = entry.second;
-    SeqNo seqCurrent = result.mergedVector.get(nidOther);
+  for (const auto& [nidOther, seqEntries] : remoteVector.getAllEntries()) {
+    for (const auto& [bootstrapTime, seqOther] : seqEntries) {
+      SeqNo seqCurrent = result.mergedVector.get(nidOther, bootstrapTime);
 
-    if (seqCurrent < seqOther) {
-      result.otherVectorNew = true;
-      result.missingData.push_back({nidOther, seqCurrent + 1, seqOther, 0});
-      result.mergedVector.set(nidOther, seqOther);
+      if (seqCurrent < seqOther) {
+        result.otherVectorNew = true;
+        result.missingData.push_back({nidOther, seqCurrent + 1, seqOther, 0, bootstrapTime});
+        result.mergedVector.set(nidOther, bootstrapTime, seqOther);
+      }
     }
   }
 
-  for (const auto& entry : result.mergedVector) {
-    const NodeID& nid = entry.first;
-    SeqNo seq = entry.second;
-    SeqNo seqOther = remoteVector.get(nid);
+  for (const auto& [nid, seqEntries] : result.mergedVector.getAllEntries()) {
+    for (const auto& [bootstrapTime, seq] : seqEntries) {
+      SeqNo seqOther = remoteVector.get(nid, bootstrapTime);
 
-    if (seqOther < seq) {
-      result.myVectorNew = true;
+      if (seqOther < seq) {
+        result.myVectorNew = true;
+        break;
+      }
+    }
+    if (result.myVectorNew) {
       break;
     }
   }
@@ -1162,6 +1174,9 @@ SVSyncCore::getSeqNo(const NodeID& nid) const
 {
   std::lock_guard<std::mutex> lock(m_vvMutex);
   NodeID t_nid = (nid == EMPTY_NODE_ID) ? m_id : nid;
+  if (t_nid == m_id) {
+    return m_vv.get(t_nid, m_bootstrapTime);
+  }
   return m_vv.get(t_nid);
 }
 
@@ -1169,12 +1184,19 @@ void
 SVSyncCore::updateSeqNo(const SeqNo& seq, const NodeID& nid)
 {
   NodeID t_nid = (nid == EMPTY_NODE_ID) ? m_id : nid;
+  updateSeqNo(seq, m_bootstrapTime, t_nid);
+}
+
+void
+SVSyncCore::updateSeqNo(const SeqNo& seq, BootstrapTime bootstrapTime, const NodeID& nid)
+{
+  NodeID t_nid = (nid == EMPTY_NODE_ID) ? m_id : nid;
 
   SeqNo prev;
   {
     std::lock_guard<std::mutex> lock(m_vvMutex);
-    prev = m_vv.get(t_nid);
-    m_vv.set(t_nid, seq);
+    prev = m_vv.get(t_nid, bootstrapTime);
+    m_vv.set(t_nid, bootstrapTime, seq);
     if (seq > prev) {
       ++m_stateGeneration;
     }
@@ -1220,13 +1242,13 @@ SVSyncCore::recordVector(const VersionVector& vvOther)
 
   std::lock_guard<std::mutex> lock1(m_vvMutex);
 
-  for (const auto& entry : vvOther) {
-    NodeID nidOther = entry.first;
-    SeqNo seqOther = entry.second;
-    SeqNo seqCurrent = m_recordedVv->get(nidOther);
+  for (const auto& [nidOther, seqEntries] : vvOther.getAllEntries()) {
+    for (const auto& [bootstrapTime, seqOther] : seqEntries) {
+      SeqNo seqCurrent = m_recordedVv->get(nidOther, bootstrapTime);
 
-    if (seqCurrent < seqOther) {
-      m_recordedVv->set(nidOther, seqOther);
+      if (seqCurrent < seqOther) {
+        m_recordedVv->set(nidOther, bootstrapTime, seqOther);
+      }
     }
   }
 

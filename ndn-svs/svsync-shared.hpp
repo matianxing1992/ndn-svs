@@ -19,6 +19,8 @@
 
 #include "svsync-base.hpp"
 
+#include <string>
+
 namespace ndn::svs {
 
 /**
@@ -48,11 +50,6 @@ public:
   {
   }
 
-  Name getDataName(const NodeID& nid, const SeqNo& seqNo) override
-  {
-    return Name(m_dataPrefix).append(nid).appendNumber(seqNo);
-  }
-
   /** @brief Set whether data of other nodes is also cached and served */
   void setCacheAll(bool val)
   {
@@ -60,6 +57,14 @@ public:
   }
 
 private:
+  Name makeDataName(const NodeID& nid, const BootstrapTime& bootstrapTime,
+                    const SeqNo& seqNo) override
+  {
+    return Name(m_dataPrefix).append(nid)
+                             .append("t=" + std::to_string(bootstrapTime))
+                             .append("seq=" + std::to_string(seqNo));
+  }
+
   bool shouldCache(const Data&) const override
   {
     return m_cacheAll;

@@ -83,7 +83,7 @@ SVSyncBase::insertDataAtSeq(const Block& content, const ndn::time::milliseconds&
                             const NodeID& nid, const SeqNo seq, uint32_t contentType)
 {
   NodeID pubId = nid != EMPTY_NODE_ID ? nid : m_id;
-  Name dataName = getDataName(pubId, seq);
+  Name dataName = getDataName(pubId, m_core.getBootstrapTime(), seq);
   auto data = std::make_shared<Data>(dataName);
   data->setContent(content);
   data->setFreshnessPeriod(freshness);
@@ -107,7 +107,7 @@ SVSyncBase::insertDataSegment(const Block& content,
                               const Name::Component& finalBlock,
                               uint32_t contentType)
 {
-  Name dataName = getDataName(nid, seq).appendVersion(0).appendSegment(segNo);
+  Name dataName = getDataName(nid, m_core.getBootstrapTime(), seq).appendVersion(0).appendSegment(segNo);
   auto data = std::make_shared<Data>(dataName);
   data->setContent(content);
   data->setFreshnessPeriod(freshness);
@@ -160,7 +160,20 @@ SVSyncBase::fetchData(const NodeID& nid,
   DataValidationErrorCallback onValidationFailed =
     std::bind(&SVSyncBase::onDataValidationFailed, this, _1, _2);
   TimeoutCallback onTimeout = [](auto&&...) {};
-  fetchData(nid, seqNo, onValidated, onValidationFailed, onTimeout, nRetries);
+  fetchData(nid, m_core.getBootstrapTime(), seqNo, onValidated, onValidationFailed, onTimeout, nRetries);
+}
+
+void
+SVSyncBase::fetchData(const NodeID& nid,
+                      const BootstrapTime& bootstrapTime,
+                      const SeqNo& seqNo,
+                      const DataValidatedCallback& onValidated,
+                      int nRetries)
+{
+  DataValidationErrorCallback onValidationFailed =
+    std::bind(&SVSyncBase::onDataValidationFailed, this, _1, _2);
+  TimeoutCallback onTimeout = [](auto&&...) {};
+  fetchData(nid, bootstrapTime, seqNo, onValidated, onValidationFailed, onTimeout, nRetries);
 }
 
 void
@@ -171,7 +184,19 @@ SVSyncBase::fetchData(const NodeID& nid,
                       const TimeoutCallback& onTimeout,
                       int nRetries)
 {
-  Name interestName = getDataName(nid, seqNo);
+  fetchData(nid, m_core.getBootstrapTime(), seqNo, onValidated, onValidationFailed, onTimeout, nRetries);
+}
+
+void
+SVSyncBase::fetchData(const NodeID& nid,
+                      const BootstrapTime& bootstrapTime,
+                      const SeqNo& seqNo,
+                      const DataValidatedCallback& onValidated,
+                      const DataValidationErrorCallback& onValidationFailed,
+                      const TimeoutCallback& onTimeout,
+                      int nRetries)
+{
+  Name interestName = getDataName(nid, bootstrapTime, seqNo);
   Interest interest(interestName);
   interest.setCanBePrefix(true);
   interest.setInterestLifetime(2_s);

@@ -17,7 +17,23 @@
 #include "version-vector.hpp"
 #include "tlv.hpp"
 
+#include <algorithm>
+#include <chrono>
+
 namespace ndn::svs {
+
+namespace {
+
+bool
+isBootstrapTimeTooFarInFuture(BootstrapTime bootstrapTime)
+{
+  const auto now = static_cast<BootstrapTime>(
+    std::chrono::duration_cast<std::chrono::seconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count());
+  return bootstrapTime > now + 86400;
+}
+
+} // namespace
 
 VersionVector::VersionVector(const ndn::Block& block)
 {
@@ -31,10 +47,32 @@ VersionVector::VersionVector(const ndn::Block& block)
       NDN_THROW(ndn::tlv::Error("StateVectorEntry", it->type()));
 
     it->parse();
-    NodeID nodeId(it->elements().at(0));
-    SeqNo seqNo = ndn::encoding::readNonNegativeInteger(it->elements().at(1));
+    const auto& elements = it->elements();
+    if (elements.empty() || elements.front().type() != ndn::tlv::Name) {
+      NDN_THROW(ndn::tlv::Error("Name", elements.empty() ? 0 : elements.front().type()));
+    }
 
-    m_map[nodeId] = seqNo;
+    NodeID nodeId(elements.front());
+    for (auto seqIt = elements.begin() + 1; seqIt != elements.end(); ++seqIt) {
+      if (seqIt->type() == tlv::SeqNoEntry) {
+        seqIt->parse();
+        if (seqIt->elements().size() < 2 ||
+            seqIt->elements().at(0).type() != tlv::BootstrapTime ||
+            seqIt->elements().at(1).type() != tlv::SeqNo) {
+          NDN_THROW(ndn::tlv::Error("SeqNoEntry", seqIt->type()));
+        }
+        BootstrapTime bootstrapTime =
+          ndn::encoding::readNonNegativeInteger(seqIt->elements().at(0));
+        if (isBootstrapTimeTooFarInFuture(bootstrapTime)) {
+          NDN_THROW(Error("State vector bootstrap time is too far in the future"));
+        }
+        SeqNo seqNo = ndn::encoding::readNonNegativeInteger(seqIt->elements().at(1));
+        set(nodeId, bootstrapTime, seqNo);
+        continue;
+      }
+
+      NDN_THROW(ndn::tlv::Error("SeqNoEntry", seqIt->type()));
+    }
   }
 }
 
@@ -44,9 +82,18 @@ VersionVector::encode() const
   ndn::encoding::EncodingBuffer enc;
   size_t totalLength = 0;
 
-  for (auto it = m_map.rbegin(); it != m_map.rend(); it++) {
-    // SeqNo
-    size_t entryLength = ndn::encoding::prependNonNegativeIntegerBlock(enc, tlv::SeqNo, it->second);
+  for (auto it = m_entries.rbegin(); it != m_entries.rend(); it++) {
+    size_t entryLength = 0;
+
+    for (auto seqIt = it->second.rbegin(); seqIt != it->second.rend(); ++seqIt) {
+      size_t seqEntryLength = 0;
+      seqEntryLength += ndn::encoding::prependNonNegativeIntegerBlock(enc, tlv::SeqNo, seqIt->second);
+      seqEntryLength += ndn::encoding::prependNonNegativeIntegerBlock(enc, tlv::BootstrapTime,
+                                                                      seqIt->first);
+      entryLength += enc.prependVarNumber(seqEntryLength);
+      entryLength += enc.prependVarNumber(tlv::SeqNoEntry);
+      entryLength += seqEntryLength;
+    }
 
     // NodeID (Name)
     entryLength += ndn::encoding::prependBlock(enc, it->first.wireEncode());
@@ -65,10 +112,30 @@ std::string
 VersionVector::toStr() const
 {
   std::ostringstream stream;
-  for (const auto& elem : m_map) {
-    stream << elem.first << ":" << elem.second << " ";
+  for (const auto& elem : m_entries) {
+    stream << elem.first << ":";
+    for (const auto& seqEntry : elem.second) {
+      stream << "[" << seqEntry.first << "," << seqEntry.second << "]";
+    }
+    stream << " ";
   }
   return stream.str();
+}
+
+void
+VersionVector::refreshLatest(const NodeID& nid)
+{
+  auto node = m_entries.find(nid);
+  if (node == m_entries.end() || node->second.empty()) {
+    m_latestMap.erase(nid);
+    return;
+  }
+
+  SeqNo latestSeqNo = 0;
+  for (const auto& [bootstrapTime, seqNo] : node->second) {
+    latestSeqNo = std::max(latestSeqNo, seqNo);
+  }
+  m_latestMap[nid] = latestSeqNo;
 }
 
 } // namespace ndn::svs

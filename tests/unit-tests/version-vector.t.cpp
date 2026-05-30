@@ -28,8 +28,8 @@ class VersionVectorFixture
 protected:
   VersionVectorFixture()
   {
-    v.set("one", 1);
-    v.set("two", 2);
+    v.set("one", 100, 1);
+    v.set("two", 200, 2);
   }
 
 protected:
@@ -47,8 +47,9 @@ BOOST_AUTO_TEST_CASE(Get)
 
 BOOST_AUTO_TEST_CASE(Set)
 {
-  BOOST_CHECK_EQUAL(v.set("four", 44), 44);
+  BOOST_CHECK_EQUAL(v.set("four", 400, 44), 44);
   BOOST_CHECK_EQUAL(v.get("four"), 44);
+  BOOST_CHECK_EQUAL(v.get("four", 400), 44);
 }
 
 BOOST_AUTO_TEST_CASE(Iterate)
@@ -66,31 +67,44 @@ BOOST_AUTO_TEST_CASE(Iterate)
 BOOST_AUTO_TEST_CASE(EncodeDecode)
 {
   ndn::Block block = v.encode();
-  BOOST_CHECK_EQUAL(block.value_size(), 24);
+  BOOST_CHECK_GT(block.value_size(), 24);
 
   VersionVector dv(block);
   BOOST_CHECK_EQUAL(dv.get("one"), 1);
   BOOST_CHECK_EQUAL(dv.get("two"), 2);
+  BOOST_CHECK_EQUAL(dv.get("one", 100), 1);
+  BOOST_CHECK_EQUAL(dv.get("two", 200), 2);
 }
 
-BOOST_AUTO_TEST_CASE(DecodeStatic)
+BOOST_AUTO_TEST_CASE(RejectLegacyDirectSeqNo)
 {
-  // Hex: CA0A070508036F6E65CC0101CA0A0705080374776FCC0102
+  // Legacy pre-v3 format used StateVectorEntry(Name, SeqNo) without SeqNoEntry.
   constexpr std::string_view encoded{ "\xCA\x0A\x07\x05\x08\x03\x6F\x6E\x65\xCC\x01\x01"
                                       "\xCA\x0A\x07\x05\x08\x03\x74\x77\x6F\xCC\x01\x02" };
-  VersionVector dv(ndn::encoding::makeStringBlock(svs::tlv::StateVector, encoded));
-  BOOST_CHECK_EQUAL(dv.get("one"), 1);
-  BOOST_CHECK_EQUAL(dv.get("two"), 2);
+  BOOST_CHECK_THROW(VersionVector(ndn::encoding::makeStringBlock(svs::tlv::StateVector, encoded)),
+                    ndn::tlv::Error);
+}
+
+BOOST_AUTO_TEST_CASE(MultipleBootstraps)
+{
+  VersionVector vector;
+  vector.set("node", 100, 10);
+  vector.set("node", 200, 1);
+
+  VersionVector decoded(vector.encode());
+  BOOST_CHECK_EQUAL(decoded.get("node", 100), 10);
+  BOOST_CHECK_EQUAL(decoded.get("node", 200), 1);
+  BOOST_CHECK_EQUAL(decoded.getEntries("node").size(), 2);
 }
 
 BOOST_AUTO_TEST_CASE(Ordering)
 {
   VersionVector v1;
-  v1.set("one", 1);
-  v1.set("two", 2);
+  v1.set("one", 100, 1);
+  v1.set("two", 200, 2);
   VersionVector v2;
-  v2.set("two", 2);
-  v2.set("one", 1);
+  v2.set("two", 200, 2);
+  v2.set("one", 100, 1);
 
   Block v1e = v1.encode();
   Block v2e = v2.encode();
