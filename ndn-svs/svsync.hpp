@@ -19,6 +19,8 @@
 
 #include "svsync-base.hpp"
 
+#include <ndn-cxx/util/time.hpp>
+
 namespace ndn::svs {
 
 /**
@@ -47,9 +49,14 @@ public:
   {
   }
 
-  Name getDataName(const NodeID& nid, const SeqNo& seqNo) override
+private:
+  Name makeDataName(const NodeID& nid, const BootstrapTime& bootstrapTime,
+                    const SeqNo& seqNo) override
   {
-    return Name(nid).append(m_syncPrefix).appendNumber(seqNo);
+    return Name(nid).append(m_syncPrefix)
+                    .append(Name::Component::fromTimestamp(
+                      time::fromUnixTimestamp(time::seconds(bootstrapTime))))
+                    .append(Name::Component::fromSequenceNumber(seqNo));
   }
 };
 

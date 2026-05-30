@@ -43,6 +43,8 @@ public:
   SeqNo high;
   /// @brief ndn::lp::IncomingFaceIdTag
   uint64_t incomingFace;
+  /// @brief bootstrap time identifying this node's current SVS session
+  BootstrapTime bootstrapTime = 0;
 };
 
 /**
@@ -179,6 +181,11 @@ public:
    */
   SeqNo getSeqNo(const NodeID& nid = EMPTY_NODE_ID) const;
 
+  BootstrapTime getBootstrapTime() const
+  {
+    return m_bootstrapTime;
+  }
+
   /**
    * @brief Update the seqNo of the local session
    *
@@ -188,6 +195,8 @@ public:
    * @param nid The NodeID of node to update.
    */
   void updateSeqNo(const SeqNo& seq, const NodeID& nid = EMPTY_NODE_ID);
+
+  void updateSeqNo(const SeqNo& seq, BootstrapTime bootstrapTime, const NodeID& nid);
 
   /// @brief Get all the nodeIDs
   std::set<NodeID> getNodeIds() const;
@@ -354,6 +363,7 @@ private:
   const Name m_syncPrefix;
   const SecurityOptions m_securityOptions;
   const NodeID m_id;
+  const BootstrapTime m_bootstrapTime;
   ndn::ScopedRegisteredPrefixHandle m_syncRegisteredPrefix;
 
   const UpdateCallback m_onUpdate;

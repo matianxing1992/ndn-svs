@@ -170,6 +170,12 @@ public:
                  const DataValidatedCallback& onValidated,
                  int nRetries = 0);
 
+  void fetchData(const NodeID& nid,
+                 const BootstrapTime& bootstrapTime,
+                 const SeqNo& seq,
+                 const DataValidatedCallback& onValidated,
+                 int nRetries = 0);
+
   /**
    * @brief Retrive a data packet with a particular seqNo from a session
    *
@@ -189,6 +195,14 @@ public:
                  const TimeoutCallback& onTimeout,
                  int nRetries = 0);
 
+  void fetchData(const NodeID& nid,
+                 const BootstrapTime& bootstrapTime,
+                 const SeqNo& seq,
+                 const DataValidatedCallback& onValidated,
+                 const DataValidationErrorCallback& onValidationFailed,
+                 const TimeoutCallback& onTimeout,
+                 int nRetries = 0);
+
   /** @brief Get the underlying data store */
   DataStore& getDataStore()
   {
@@ -201,6 +215,16 @@ public:
     return m_core;
   }
 
+  Name getDataName(const NodeID& nid, const BootstrapTime& bootstrapTime, const SeqNo& seqNo)
+  {
+    return makeDataName(nid, bootstrapTime, seqNo);
+  }
+
+  Name getDataName(const NodeID& nid, const SeqNo& seqNo)
+  {
+    return makeDataName(nid, m_core.getBootstrapTime(), seqNo);
+  }
+
 protected:
   /**
    * @brief Return data name for a given packet
@@ -210,7 +234,8 @@ protected:
    * data prefix for proper functionality, or the application must
    * independently produce data under the prefix.
    */
-  virtual Name getDataName(const NodeID& nid, const SeqNo& seqNo) = 0;
+  virtual Name makeDataName(const NodeID& nid, const BootstrapTime& bootstrapTime,
+                            const SeqNo& seqNo) = 0;
 
 public:
   static inline const NodeID EMPTY_NODE_ID;
