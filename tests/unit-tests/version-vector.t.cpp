@@ -19,6 +19,8 @@
 
 #include "tests/boost-test.hpp"
 
+#include <chrono>
+
 namespace ndn::tests {
 
 using namespace ndn::svs;
@@ -113,6 +115,19 @@ BOOST_AUTO_TEST_CASE(Ordering)
   std::string v2str(reinterpret_cast<const char*>(v2e.value()), v2e.value_size());
 
   BOOST_CHECK_EQUAL(v1str, v2str);
+}
+
+
+BOOST_AUTO_TEST_CASE(RejectTooFarFutureBootstrapTime)
+{
+  const auto now = static_cast<BootstrapTime>(
+    std::chrono::duration_cast<std::chrono::seconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count());
+
+  VersionVector vector;
+  vector.set("peer", now + 2 * 86400, 1);
+
+  BOOST_CHECK_THROW(VersionVector(vector.encode()), VersionVector::Error);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

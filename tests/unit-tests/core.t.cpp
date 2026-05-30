@@ -289,6 +289,65 @@ BOOST_AUTO_TEST_CASE(ParallelSyncProductionDropsStaleResult)
   BOOST_CHECK_GE(stats.syncProductionJobsSubmitted, 1);
 }
 
+
+BOOST_AUTO_TEST_CASE(SyncInterestMissingDataCarriesBootstrapTimeInCallback)
+{
+  DummyClientFace localFace;
+  std::vector<MissingDataInfo> callbacks;
+
+  SVSyncCore core(localFace, "/ndn/test", [&] (const std::vector<MissingDataInfo>& updates) {
+    callbacks = updates;
+  });
+
+  VersionVector remote;
+  const BootstrapTime bootstrapTime = 12345;
+  remote.set("peer", bootstrapTime, 3);
+  core.onSyncInterestValidated(makeSyncInterest("/ndn/test", remote));
+
+  runIoUntil(localFace, [&] { return !callbacks.empty(); });
+
+  BOOST_REQUIRE_EQUAL(callbacks.size(), 1);
+  BOOST_CHECK_EQUAL(callbacks[0].nodeId, "peer");
+  BOOST_CHECK_EQUAL(callbacks[0].bootstrapTime, bootstrapTime);
+  BOOST_CHECK_EQUAL(callbacks[0].low, 1);
+  BOOST_CHECK_EQUAL(callbacks[0].high, 3);
+}
+
+BOOST_AUTO_TEST_CASE(ParallelSyncProductionRecordsExtraBlockAndCompletesJobs)
+{
+  size_t extraBlockInvocations = 0;
+
+  DummyClientFace localFace;
+  SVSyncCore core(localFace, "/ndn/test", [] (const std::vector<MissingDataInfo>&) {});
+  core.setParallelSyncProduction(true, 2, 16, true, true);
+  core.setGetExtraBlockCallback([&] (const VersionVector&) {
+    ++extraBlockInvocations;
+    return VersionVector().encode();
+  });
+
+  core.sendInitialInterest();
+  runIoUntil(localFace, [&] {
+    return !localFace.sentInterests.empty();
+  });
+  BOOST_REQUIRE(!localFace.sentInterests.empty());
+  localFace.sentInterests.clear();
+
+  core.updateSeqNo(1, "local-node");
+  runIoUntil(localFace, [&] {
+    auto stats = core.getSyncProcessingStats();
+    return stats.syncProductionJobsCompleted > 0 ||
+           stats.syncProductionJobsStale > 0 ||
+           stats.syncProductionJobsDropped > 0;
+  });
+
+  auto stats = core.getSyncProcessingStats();
+  BOOST_CHECK_GE(stats.syncProductionJobsSubmitted, 1);
+  BOOST_CHECK_GE(stats.syncProductionJobsCompleted +
+                stats.syncProductionJobsStale +
+                stats.syncProductionJobsDropped, 1);
+  BOOST_CHECK_GE(extraBlockInvocations, 1);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 } // namespace ndn::tests
