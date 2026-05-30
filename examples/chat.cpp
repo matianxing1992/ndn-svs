@@ -84,7 +84,7 @@ protected:
       for (ndn::svs::SeqNo s = v[i].low; s <= v[i].high; ++s) {
         // Request a single data packet using the SVSync API
         ndn::svs::NodeID nid = v[i].nodeId;
-        m_svs->fetchData(nid, s, [nid](const auto& data) {
+        m_svs->fetchData(nid, v[i].bootstrapTime, s, [nid](const auto& data) {
           std::string content(reinterpret_cast<const char*>(data.getContent().value()),
                               data.getContent().value_size());
           std::cout << data.getName() << " : " << content << std::endl;
