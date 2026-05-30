@@ -47,6 +47,21 @@ BOOST_AUTO_TEST_CASE(KeyChainSignerSignsV03Interests)
   BOOST_CHECK_GT(*second.getSignatureInfo()->getTime(), *first.getSignatureInfo()->getTime());
 }
 
+BOOST_AUTO_TEST_CASE(KeyChainSignerSignsV3StateVectorData)
+{
+  KeyChain keyChain("pib-memory:security-options-data", "tpm-memory:security-options-data");
+  auto identity = keyChain.createIdentity("/security-options/data");
+  SecurityOptions options(keyChain);
+  options.dataSigner->signingInfo = security::signingByIdentity(identity);
+
+  Data data("/sync/v=3");
+  data.setContent("state-vector");
+  options.dataSigner->sign(data);
+
+  BOOST_CHECK(data.getSignatureValue().isValid());
+  BOOST_CHECK(data.getSignatureInfo().hasKeyLocator());
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 } // namespace ndn::tests
