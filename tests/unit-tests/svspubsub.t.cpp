@@ -116,6 +116,77 @@ BOOST_AUTO_TEST_CASE(AsyncPublishQueuesWithoutImmediateFacePut)
   BOOST_REQUIRE_GE(face.sentData.size(), 2);
 }
 
+BOOST_AUTO_TEST_CASE(AsyncPublishNameOnlyAndPacketAreQueuedAndCommitted)
+{
+  DummyClientFace face;
+  SVSPubSubOptions opts;
+  opts.useTimestamp = false;
+
+  SVSPubSub pubsub("/sync", "/local", face,
+                   [] (const std::vector<MissingDataInfo>&) {},
+                   opts);
+
+  auto seq1 = pubsub.publishAsync("/app/name-only", Name("/provider"));
+  Data packet("/app/packet");
+  const std::string body = "abc";
+  packet.setContent(make_span(reinterpret_cast<const uint8_t*>(body.data()), body.size()));
+  auto seq2 = pubsub.publishPacketAsync(packet, Name("/provider"));
+
+  BOOST_CHECK_EQUAL(seq2, seq1 + 1);
+  BOOST_CHECK_EQUAL(face.sentData.size(), 0);
+
+  runIoUntil(face, [&] {
+    return !face.sentData.empty();
+  });
+  BOOST_CHECK_GE(face.sentInterests.size() + face.sentData.size(), 1);
+}
+
+BOOST_AUTO_TEST_CASE(LatePiggyDataStillSatisfiesPendingFetch)
+{
+  DummyClientFace face;
+  SVSPubSubOptions opts;
+  opts.useTimestamp = false;
+
+  KeyChain keyChain("pib-memory:svspubsub-test", "tpm-memory:svspubsub-test");
+  keyChain.createIdentity("/svspubsub-test");
+
+  size_t callbackCount = 0;
+  std::string payload;
+  Name producer;
+  SeqNo receivedSeq = 0;
+
+  SVSPubSub pubsub("/sync", "/local", face,
+                   [] (const std::vector<MissingDataInfo>&) {},
+                   opts);
+  pubsub.subscribe("/app/item", [&] (const SVSPubSub::SubscriptionData& data) {
+    ++callbackCount;
+    payload.assign(reinterpret_cast<const char*>(data.data.data()), data.data.size());
+    producer = data.producerPrefix;
+    receivedSeq = data.seqNo;
+  });
+
+  BootstrapTime bootstrapTime = 200;
+  pubsub.insertMapping("/peer", bootstrapTime, 1, "/app/item", {});
+  pubsub.processMapping("/peer", bootstrapTime, 1);
+
+  Data piggyData("/app/item");
+  const std::string body = "late";
+  piggyData.setContent(make_span(reinterpret_cast<const uint8_t*>(body.data()),
+                                body.size()));
+  keyChain.sign(piggyData);
+
+  MappingList extra("/peer");
+  Block params = extra.encode();
+  params.push_back(piggyData.wireEncode());
+  params.encode();
+
+  pubsub.onRecvExtraData(params, VersionVector());
+  BOOST_CHECK_EQUAL(callbackCount, 1);
+  BOOST_CHECK_EQUAL(payload, body);
+  BOOST_CHECK_EQUAL(producer, Name("/peer"));
+  BOOST_CHECK_EQUAL(receivedSeq, 1);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 } // namespace ndn::tests
