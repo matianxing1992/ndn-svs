@@ -740,9 +740,15 @@ SVSPubSub::processMapping(const NodeID& nodeId, BootstrapTime bootstrapTime, Seq
 void
 SVSPubSub::fetchAll()
 {
+  std::vector<PublicationKey> pendingFetches;
+  pendingFetches.reserve(m_fetchMap.size());
   for (const auto& pair : m_fetchMap) {
-    // Check if already fetching this publication
-    auto key = pair.first;
+    pendingFetches.push_back(pair.first);
+  }
+
+  for (const auto& key : pendingFetches) {
+    if (m_fetchMap.find(key) == m_fetchMap.end())
+      continue;
     if (m_fetchingMap.find(key) != m_fetchingMap.end())
       continue;
     m_fetchingMap[key] = true;
