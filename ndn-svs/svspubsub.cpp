@@ -627,15 +627,10 @@ SVSPubSub::updateCallbackInternal(const std::vector<MissingDataInfo>& info)
 
         m_mappingProvider.fetchNameMapping(
           truncatedRemainingInfo,
-          [this, remainingInfo, streamName](const MappingList& list) {
-            bool queued = false;
-            for (const auto& entry : list.pairs)
-              queued |= this->processMapping(streamName, entry.bootstrapTime, entry.seqNo);
-
-            if (queued)
-              this->fetchAll();
+          [this, truncatedRemainingInfo, streamName](const MappingList& list) {
+            this->onFetchedNameMappings(truncatedRemainingInfo, streamName, list);
           },
-          -1);
+          m_opts.mappingFetchRetries);
 
         remainingInfo.low += 11;
       }
@@ -735,6 +730,58 @@ SVSPubSub::processMapping(const NodeID& nodeId, BootstrapTime bootstrapTime, Seq
   }
 
   return queued;
+}
+
+void
+SVSPubSub::onFetchedNameMappings(const MissingDataInfo& requested,
+                                 const NodeID& streamName,
+                                 const MappingList& list)
+{
+  if (list.pairs.empty())
+    return;
+
+  const SeqNo requestedHigh = std::max(requested.high, requested.low);
+  std::set<SeqNo> returnedSeqs;
+  bool queued = false;
+  for (const auto& entry : list.pairs) {
+    if (entry.bootstrapTime == requested.bootstrapTime &&
+        entry.seqNo >= requested.low &&
+        entry.seqNo <= requestedHigh) {
+      returnedSeqs.insert(entry.seqNo);
+    }
+    queued |= processMapping(streamName, entry.bootstrapTime, entry.seqNo);
+  }
+
+  if (queued)
+    fetchAll();
+
+  std::optional<SeqNo> missingLow;
+  auto fetchMissingRange = [this, &requested, &streamName](SeqNo low, SeqNo high) {
+    MissingDataInfo missing = requested;
+    missing.low = low;
+    missing.high = high;
+    m_mappingProvider.fetchNameMapping(
+      missing,
+      [this, missing, streamName](const MappingList& missingList) {
+        this->onFetchedNameMappings(missing, streamName, missingList);
+      },
+      m_opts.mappingFetchRetries);
+  };
+
+  for (SeqNo seq = requested.low; seq <= requestedHigh; ++seq) {
+    if (returnedSeqs.count(seq) == 0) {
+      if (!missingLow)
+        missingLow = seq;
+      continue;
+    }
+
+    if (missingLow) {
+      fetchMissingRange(*missingLow, seq - 1);
+      missingLow.reset();
+    }
+  }
+  if (missingLow)
+    fetchMissingRange(*missingLow, requestedHigh);
 }
 
 void

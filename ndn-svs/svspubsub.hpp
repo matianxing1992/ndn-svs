@@ -60,6 +60,16 @@ struct SVSPubSubOptions
    * The useTimestamp option should be enabled for this to work.
    */
   time::milliseconds maxPubAge = 0_ms;
+
+  /**
+   * @brief Number of retries for network mapping fetches.
+   *
+   * Missing mapping providers can occur when a short-lived publisher exits
+   * after announcing a sequence number. The default preserves the historical
+   * unbounded retry behavior; applications that prefer bounded stale mapping
+   * fetches may set this to a finite value.
+   */
+  int mappingFetchRetries = -1;
 };
 
 /**
@@ -275,6 +285,10 @@ NDN_SVS_PUBLIC_WITH_TESTS_ELSE_PRIVATE:
    * @throws std::exception error if mapping is not found
    */
   bool processMapping(const NodeID& nodeId, BootstrapTime bootstrapTime, SeqNo seqNo);
+
+  void onFetchedNameMappings(const MissingDataInfo& requested,
+                             const NodeID& streamName,
+                             const MappingList& list);
 
   void fetchAll();
 
