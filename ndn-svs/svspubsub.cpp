@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <set>
 
 namespace ndn::svs {
 
@@ -625,12 +626,7 @@ SVSPubSub::updateCallbackInternal(const std::vector<MissingDataInfo>& info)
           truncatedRemainingInfo.high = truncatedRemainingInfo.low + 10;
         }
 
-        m_mappingProvider.fetchNameMapping(
-          truncatedRemainingInfo,
-          [this, truncatedRemainingInfo, streamName](const MappingList& list) {
-            this->onFetchedNameMappings(truncatedRemainingInfo, streamName, list);
-          },
-          m_opts.mappingFetchRetries);
+        scheduleMappingFetch(truncatedRemainingInfo, streamName);
 
         remainingInfo.low += 11;
       }
@@ -760,12 +756,7 @@ SVSPubSub::onFetchedNameMappings(const MissingDataInfo& requested,
     MissingDataInfo missing = requested;
     missing.low = low;
     missing.high = high;
-    m_mappingProvider.fetchNameMapping(
-      missing,
-      [this, missing, streamName](const MappingList& missingList) {
-        this->onFetchedNameMappings(missing, streamName, missingList);
-      },
-      m_opts.mappingFetchRetries);
+    scheduleMappingFetch(missing, streamName);
   };
 
   for (SeqNo seq = requested.low; seq <= requestedHigh; ++seq) {
@@ -782,6 +773,70 @@ SVSPubSub::onFetchedNameMappings(const MissingDataInfo& requested,
   }
   if (missingLow)
     fetchMissingRange(*missingLow, requestedHigh);
+}
+
+bool
+SVSPubSub::scheduleMappingFetch(const MissingDataInfo& requested,
+                                const NodeID& streamName)
+{
+  MissingDataInfo query = requested;
+  query.high = std::max(query.high, query.low);
+  const MappingFetchKey key(query.nodeId, query.bootstrapTime, query.low, query.high);
+  const auto now = std::chrono::steady_clock::now();
+
+  auto inFlight = m_mappingFetchInFlight.find(key);
+  if (inFlight != m_mappingFetchInFlight.end()) {
+    NDN_LOG_TRACE("event=mapping_fetch_suppress reason=in_flight node=" << query.nodeId
+                  << " bootstrap=" << query.bootstrapTime
+                  << " low=" << query.low
+                  << " high=" << query.high);
+    return false;
+  }
+
+  auto suppress = m_mappingFetchSuppressUntil.find(key);
+  if (suppress != m_mappingFetchSuppressUntil.end() && suppress->second > now) {
+    auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+      suppress->second - now);
+    NDN_LOG_TRACE("event=mapping_fetch_suppress reason=backoff node=" << query.nodeId
+                  << " bootstrap=" << query.bootstrapTime
+                  << " low=" << query.low
+                  << " high=" << query.high
+                  << " remaining_ms=" << remaining.count());
+    return false;
+  }
+
+  if (suppress != m_mappingFetchSuppressUntil.end())
+    m_mappingFetchSuppressUntil.erase(suppress);
+  m_mappingFetchInFlight[key] = true;
+
+  m_mappingProvider.fetchNameMapping(
+    query,
+    [this, query, streamName, key](const MappingList& list) {
+      this->markMappingFetchComplete(key);
+      this->onFetchedNameMappings(query, streamName, list);
+    },
+    [this, key](const Interest&) {
+      this->markMappingFetchFailed(key);
+    },
+    m_opts.mappingFetchRetries);
+  return true;
+}
+
+void
+SVSPubSub::markMappingFetchComplete(const MappingFetchKey& key)
+{
+  m_mappingFetchInFlight.erase(key);
+  m_mappingFetchSuppressUntil.erase(key);
+}
+
+void
+SVSPubSub::markMappingFetchFailed(const MappingFetchKey& key)
+{
+  m_mappingFetchInFlight.erase(key);
+  if (m_opts.mappingFetchFailureBackoff > 0_ms) {
+    m_mappingFetchSuppressUntil[key] = std::chrono::steady_clock::now() +
+      std::chrono::milliseconds(m_opts.mappingFetchFailureBackoff.count());
+  }
 }
 
 void

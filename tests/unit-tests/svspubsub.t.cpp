@@ -187,6 +187,33 @@ BOOST_AUTO_TEST_CASE(LatePiggyDataStillSatisfiesPendingFetch)
   BOOST_CHECK_EQUAL(receivedSeq, 1);
 }
 
+BOOST_AUTO_TEST_CASE(MappingFetchSuppressesDuplicateInFlightRange)
+{
+  DummyClientFace face;
+  SVSPubSubOptions opts;
+  opts.useTimestamp = false;
+  opts.mappingFetchRetries = 0;
+
+  SVSPubSub pubsub("/sync", "/local", face,
+                   [] (const std::vector<MissingDataInfo>&) {},
+                   opts);
+  pubsub.subscribe("/app", [] (const SVSPubSub::SubscriptionData&) {});
+
+  MissingDataInfo missing;
+  missing.nodeId = "/offline";
+  missing.bootstrapTime = 300;
+  missing.low = 1;
+  missing.high = 2;
+
+  pubsub.updateCallbackInternal({missing});
+  BOOST_REQUIRE_EQUAL(face.sentInterests.size(), 1);
+  const auto firstInterest = face.sentInterests.front().getName();
+
+  pubsub.updateCallbackInternal({missing});
+  BOOST_CHECK_EQUAL(face.sentInterests.size(), 1);
+  BOOST_CHECK_EQUAL(face.sentInterests.front().getName(), firstInterest);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 } // namespace ndn::tests
