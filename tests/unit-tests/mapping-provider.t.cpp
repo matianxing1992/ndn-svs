@@ -12,6 +12,8 @@
 
 #include <ndn-cxx/util/dummy-client-face.hpp>
 
+#include <boost/asio/io_context.hpp>
+
 #include <thread>
 #include <set>
 

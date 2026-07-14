@@ -209,6 +209,16 @@ public:
     return *m_dataStore;
   }
 
+  void setFetchInterestLifetime(time::milliseconds lifetime)
+  {
+    m_fetchInterestLifetime = std::max(1_ms, lifetime);
+  }
+
+  void setFetchWindowSize(uint16_t windowSize)
+  {
+    m_fetcher.setWindowSize(windowSize);
+  }
+
   /** @brief Get the underlying SVS core */
   SVSyncCore& getCore()
   {
@@ -273,6 +283,7 @@ private:
 
   std::shared_ptr<DataStore> m_dataStore;
   std::mutex m_dataStoreMutex;
+  time::milliseconds m_fetchInterestLifetime = 2_s;
   SVSyncCore m_core;
 };
 

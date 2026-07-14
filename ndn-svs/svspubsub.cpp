@@ -49,6 +49,87 @@ envSizeOrDefault(const char* name, size_t defaultValue)
   }
 }
 
+using SteadyClock = std::chrono::steady_clock;
+
+uint64_t
+elapsedUs(const SteadyClock::time_point& begin, const SteadyClock::time_point& end)
+{
+  return static_cast<uint64_t>(
+    std::chrono::duration_cast<std::chrono::microseconds>(end - begin).count());
+}
+
+time::milliseconds
+clampDuration(time::milliseconds value,
+              time::milliseconds lower,
+              time::milliseconds upper)
+{
+  return std::min(std::max(value, lower), upper);
+}
+
+std::chrono::milliseconds
+toStdDuration(time::milliseconds value)
+{
+  return std::chrono::milliseconds(value.count());
+}
+
+time::milliseconds
+toNdnDuration(std::chrono::steady_clock::duration value)
+{
+  return time::milliseconds(std::chrono::duration_cast<std::chrono::milliseconds>(value).count());
+}
+
+Block
+encodeRepairRequests(const std::vector<MissingDataInfo>& requests)
+{
+  ndn::encoding::EncodingBuffer enc;
+  size_t totalLength = 0;
+
+  for (auto it = requests.rbegin(); it != requests.rend(); ++it) {
+    size_t entryLength = 0;
+    entryLength += ndn::encoding::prependNonNegativeIntegerBlock(enc, tlv::SeqNo, it->high);
+    entryLength += ndn::encoding::prependNonNegativeIntegerBlock(enc, tlv::SeqNo, it->low);
+    entryLength += ndn::encoding::prependNonNegativeIntegerBlock(enc, tlv::BootstrapTime,
+                                                                 it->bootstrapTime);
+    entryLength += ndn::encoding::prependBlock(enc, it->nodeId.wireEncode());
+
+    totalLength += enc.prependVarNumber(entryLength);
+    totalLength += enc.prependVarNumber(tlv::RepairEntry);
+    totalLength += entryLength;
+  }
+
+  enc.prependVarNumber(totalLength);
+  enc.prependVarNumber(tlv::RepairData);
+  return enc.block();
+}
+
+std::vector<MissingDataInfo>
+decodeRepairRequests(const Block& block)
+{
+  std::vector<MissingDataInfo> requests;
+  block.parse();
+  for (const auto& entry : block.elements()) {
+    if (entry.type() != tlv::RepairEntry) {
+      continue;
+    }
+    entry.parse();
+    if (entry.elements().size() < 4 ||
+        entry.elements().at(0).type() != ndn::tlv::Name ||
+        entry.elements().at(1).type() != tlv::BootstrapTime ||
+        entry.elements().at(2).type() != tlv::SeqNo ||
+        entry.elements().at(3).type() != tlv::SeqNo) {
+      continue;
+    }
+
+    MissingDataInfo info;
+    info.nodeId = NodeID(entry.elements().at(0));
+    info.bootstrapTime = ndn::encoding::readNonNegativeInteger(entry.elements().at(1));
+    info.low = ndn::encoding::readNonNegativeInteger(entry.elements().at(2));
+    info.high = ndn::encoding::readNonNegativeInteger(entry.elements().at(3));
+    requests.push_back(std::move(info));
+  }
+  return requests;
+}
+
 } // namespace
 
 SVSPubSub::SVSPubSub(const Name& syncPrefix,
@@ -58,6 +139,7 @@ SVSPubSub::SVSPubSub(const Name& syncPrefix,
                      const SVSPubSubOptions& options,
                      const SecurityOptions& securityOptions)
   : m_face(face)
+  , m_scheduler(face.getIoContext())
   , m_syncPrefix(syncPrefix)
   , m_dataPrefix(nodePrefix)
   , m_onUpdate(std::move(updateCallback))
@@ -82,6 +164,12 @@ SVSPubSub::SVSPubSub(const Name& syncPrefix,
   m_piggyDataCacheLimit =
     envSizeOrDefault("NDNSF_SVS_PIGGYDATA_CACHE_LIMIT",
                      m_piggyDataCacheLimit);
+  m_svsync.setFetchInterestLifetime(
+    clampDuration(m_opts.publicationFetchInterestLifetime,
+                  m_opts.publicationFetchMinInterestLifetime,
+                  m_opts.publicationFetchMaxInterestLifetime));
+  m_svsync.setFetchWindowSize(m_opts.publicationFetchWindow);
+  m_mappingProvider.setFetchWindowSize(m_opts.mappingFetchWindow);
   m_svsync.getCore().setGetExtraBlockCallback(std::bind(&SVSPubSub::onGetExtraData, this, _1));
   m_svsync.getCore().setRecvExtraBlockCallback(std::bind(&SVSPubSub::onRecvExtraData, this, _1, _2));
 }
@@ -528,6 +616,7 @@ SVSPubSub::insertMapping(const NodeID& nid, BootstrapTime bootstrapTime, SeqNo s
       m_notificationMappingList.nodeId = nid;
       m_notificationMappingList.pairs.push_back({ bootstrapTime, seqNo, entry });
     }
+    m_piggyMappingQueue.push_back({nid, {bootstrapTime, seqNo, entry}, 0, 0});
   }
 
   // send mapping to provider
@@ -590,7 +679,7 @@ SVSPubSub::updateCallbackInternal(const std::vector<MissingDataInfo>& info)
       if (sub.prefix.isPrefixOf(streamName)) {
         // Add to fetching queue
         for (SeqNo i = stream.low; i <= stream.high; i++)
-          m_fetchMap[PublicationKey(stream.nodeId, stream.bootstrapTime, i)].push_back(sub);
+          addPublicationFetch(PublicationKey(stream.nodeId, stream.bootstrapTime, i), sub);
 
         // Prefetch next available data
         if (sub.prefetch)
@@ -635,6 +724,35 @@ SVSPubSub::updateCallbackInternal(const std::vector<MissingDataInfo>& info)
 
   fetchAll();
   m_onUpdate(info);
+}
+
+void
+SVSPubSub::addPublicationFetch(const PublicationKey& publication, const Subscription& sub)
+{
+  m_fetchMap[publication].push_back(sub);
+
+  auto& state = m_publicationFetchStates[publication];
+  if (state.firstQueued == SteadyClock::time_point{}) {
+    const auto now = SteadyClock::now();
+    const auto deadline = m_opts.maxPubAge > 0_ms ? m_opts.maxPubAge : 30_s;
+    const ProducerSessionKey session(std::get<0>(publication), std::get<1>(publication));
+    auto estimate = m_publicationLifetimeEstimates.find(session);
+
+    state.status = PublicationFetchStatus::Queued;
+    state.firstQueued = now;
+    state.deadline = now + toStdDuration(deadline);
+    state.nextAttempt = now;
+    if (estimate != m_publicationLifetimeEstimates.end() && estimate->second.lifetime > 0_ms) {
+      state.currentLifetime = estimate->second.lifetime;
+    }
+    else {
+      state.currentLifetime = m_opts.publicationFetchInterestLifetime;
+    }
+    state.currentLifetime = clampDuration(state.currentLifetime,
+                                          m_opts.publicationFetchMinInterestLifetime,
+                                          m_opts.publicationFetchMaxInterestLifetime);
+    state.currentBackoff = m_opts.publicationFetchFailureBackoff;
+  }
 }
 
 bool
@@ -693,7 +811,7 @@ SVSPubSub::processMapping(const NodeID& nodeId, BootstrapTime bootstrapTime, Seq
         deliveredFromPiggy = true;
       }
       else {
-        m_fetchMap[publication].push_back(sub);
+        addPublicationFetch(publication, sub);
         queued = true;
       }
     }
@@ -840,20 +958,230 @@ SVSPubSub::markMappingFetchFailed(const MappingFetchKey& key)
 }
 
 void
-SVSPubSub::fetchAll()
+SVSPubSub::markPublicationFetchFailed(const PublicationKey& key)
 {
-  std::vector<PublicationKey> pendingFetches;
-  pendingFetches.reserve(m_fetchMap.size());
-  for (const auto& pair : m_fetchMap) {
-    pendingFetches.push_back(pair.first);
+  auto fetchIt = m_fetchMap.find(key);
+  auto stateIt = m_publicationFetchStates.find(key);
+  if (fetchIt == m_fetchMap.end() || stateIt == m_publicationFetchStates.end()) {
+    return;
   }
 
-  for (const auto& key : pendingFetches) {
+  auto& state = stateIt->second;
+  const auto now = SteadyClock::now();
+  const bool retryBudgetExhausted =
+    m_opts.publicationFetchRetries >= 0 &&
+    state.attempts > static_cast<size_t>(m_opts.publicationFetchRetries);
+  if (retryBudgetExhausted || now >= state.deadline) {
+    state.status = PublicationFetchStatus::Expired;
+    NDN_LOG_TRACE("event=publication_fetch_expired node=" << std::get<0>(key)
+                  << " bootstrap=" << std::get<1>(key)
+                  << " seq=" << std::get<2>(key)
+                  << " attempts=" << state.attempts);
+    cleanUpFetch(key);
+    return;
+  }
+
+  rememberRepairRequest(key);
+  state.status = PublicationFetchStatus::Backoff;
+  if (state.currentBackoff <= 0_ms) {
+    state.currentBackoff = m_opts.publicationFetchFailureBackoff;
+  }
+  state.nextAttempt = now + toStdDuration(state.currentBackoff);
+  state.currentLifetime =
+    clampDuration(state.currentLifetime * 2,
+                  m_opts.publicationFetchMinInterestLifetime,
+                  m_opts.publicationFetchMaxInterestLifetime);
+
+  const ProducerSessionKey session(std::get<0>(key), std::get<1>(key));
+  m_publicationLifetimeEstimates[session].lifetime = state.currentLifetime;
+
+  NDN_LOG_TRACE("event=publication_fetch_retry_scheduled node=" << std::get<0>(key)
+                << " bootstrap=" << std::get<1>(key)
+                << " seq=" << std::get<2>(key)
+                << " attempts=" << state.attempts
+                << " backoff_ms=" << state.currentBackoff.count()
+                << " next_lifetime_ms=" << state.currentLifetime.count());
+
+  const auto nextBackoff = clampDuration(state.currentBackoff * 2,
+                                         m_opts.publicationFetchFailureBackoff,
+                                         m_opts.publicationFetchMaxBackoff);
+  state.currentBackoff = nextBackoff;
+
+  m_scheduler.schedule(toNdnDuration(state.nextAttempt - now),
+                       [this] {
+                         fetchAll();
+                       });
+}
+
+void
+SVSPubSub::observePublicationFetchSuccess(const PublicationKey& key)
+{
+  auto stateIt = m_publicationFetchStates.find(key);
+  if (stateIt == m_publicationFetchStates.end()) {
+    return;
+  }
+
+  auto& state = stateIt->second;
+  const auto now = SteadyClock::now();
+  if (state.attemptStarted != SteadyClock::time_point{}) {
+    auto rtt = toNdnDuration(now - state.attemptStarted);
+    if (rtt <= 0_ms) {
+      rtt = 1_ms;
+    }
+    const auto target = clampDuration(rtt * 2,
+                                      m_opts.publicationFetchMinInterestLifetime,
+                                      m_opts.publicationFetchMaxInterestLifetime);
+    const ProducerSessionKey session(std::get<0>(key), std::get<1>(key));
+    auto& estimate = m_publicationLifetimeEstimates[session];
+    if (estimate.lifetime <= 0_ms) {
+      estimate.lifetime = target;
+    }
+    else {
+      estimate.lifetime = clampDuration((estimate.lifetime + target) / 2,
+                                        m_opts.publicationFetchMinInterestLifetime,
+                                        m_opts.publicationFetchMaxInterestLifetime);
+    }
+    state.currentLifetime = estimate.lifetime;
+    NDN_LOG_TRACE("event=publication_fetch_success node=" << std::get<0>(key)
+                  << " bootstrap=" << std::get<1>(key)
+                  << " seq=" << std::get<2>(key)
+                  << " attempts=" << state.attempts
+                  << " rtt_ms=" << rtt.count()
+                  << " next_lifetime_ms=" << estimate.lifetime.count());
+  }
+  state.status = PublicationFetchStatus::Delivered;
+}
+
+void
+SVSPubSub::rememberRepairRequest(const PublicationKey& key)
+{
+  MissingDataInfo info;
+  info.nodeId = std::get<0>(key);
+  info.bootstrapTime = std::get<1>(key);
+  info.low = std::get<2>(key);
+  info.high = std::get<2>(key);
+
+  std::lock_guard<std::mutex> lock(m_extraDataMutex);
+  for (const auto& entry : m_repairRequestQueue) {
+    if (entry.info.nodeId == info.nodeId &&
+        entry.info.bootstrapTime == info.bootstrapTime &&
+        entry.info.low == info.low &&
+        entry.info.high == info.high) {
+      return;
+    }
+  }
+  m_repairRequestQueue.push_back({info, 0, 0});
+}
+
+void
+SVSPubSub::enqueueRepairPublication(const PublicationKey& key)
+{
+  const auto& [nodeId, bootstrapTime, seqNo] = key;
+  try {
+    auto mapping = m_mappingProvider.getMapping(nodeId, bootstrapTime, seqNo);
+    std::lock_guard<std::mutex> lock(m_extraDataMutex);
+    m_piggyMappingQueue.push_back({nodeId, {bootstrapTime, seqNo, mapping}, 0, 0});
+  }
+  catch (const std::exception&) {
+    return;
+  }
+
+  try {
+    Interest interest(m_svsync.getDataName(nodeId, bootstrapTime, seqNo));
+    interest.setCanBePrefix(true);
+    auto outer = m_svsync.getDataStore().find(interest);
+    if (!outer || outer->getContentType() != ndn::tlv::Data) {
+      return;
+    }
+    Data inner(outer->getContent().blockFromValue());
+    if (inner.wireEncode().size() > MAX_SIZE_OF_PIGGYDATA) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(m_extraDataMutex);
+    m_piggyDataQueue.push_back({inner, 0, 0});
+  }
+  catch (const std::exception&) {
+  }
+}
+
+void
+SVSPubSub::fetchAll()
+{
+  const auto now = SteadyClock::now();
+  size_t inFlight = 0;
+  std::vector<PublicationKey> ready;
+  ready.reserve(m_fetchMap.size());
+
+  for (const auto& pair : m_fetchMap) {
+    const auto& key = pair.first;
+    auto& state = m_publicationFetchStates[key];
+    if (state.firstQueued == SteadyClock::time_point{}) {
+      state.status = PublicationFetchStatus::Queued;
+      state.firstQueued = now;
+      state.deadline = now + toStdDuration(m_opts.maxPubAge > 0_ms ? m_opts.maxPubAge : 30_s);
+      state.nextAttempt = now;
+      state.currentLifetime = clampDuration(m_opts.publicationFetchInterestLifetime,
+                                            m_opts.publicationFetchMinInterestLifetime,
+                                            m_opts.publicationFetchMaxInterestLifetime);
+      state.currentBackoff = m_opts.publicationFetchFailureBackoff;
+    }
+
+    if (state.status == PublicationFetchStatus::Fetching) {
+      ++inFlight;
+      continue;
+    }
+    if (state.status == PublicationFetchStatus::Delivered ||
+        state.status == PublicationFetchStatus::Expired) {
+      continue;
+    }
+    if (now >= state.deadline) {
+      state.status = PublicationFetchStatus::Expired;
+      continue;
+    }
+    if (state.nextAttempt <= now) {
+      ready.push_back(key);
+    }
+  }
+
+  for (auto it = m_publicationFetchStates.begin(); it != m_publicationFetchStates.end();) {
+    if (it->second.status == PublicationFetchStatus::Expired &&
+        m_fetchMap.find(it->first) != m_fetchMap.end()) {
+      NDN_LOG_TRACE("event=publication_fetch_expired node=" << std::get<0>(it->first)
+                    << " bootstrap=" << std::get<1>(it->first)
+                    << " seq=" << std::get<2>(it->first)
+                    << " attempts=" << it->second.attempts);
+      m_fetchMap.erase(it->first);
+      it = m_publicationFetchStates.erase(it);
+      continue;
+    }
+    ++it;
+  }
+
+  std::sort(ready.begin(), ready.end(), [this](const PublicationKey& lhs, const PublicationKey& rhs) {
+    const auto& lhsState = m_publicationFetchStates.at(lhs);
+    const auto& rhsState = m_publicationFetchStates.at(rhs);
+    if (lhsState.attempts != rhsState.attempts) {
+      return lhsState.attempts < rhsState.attempts;
+    }
+    if (std::get<1>(lhs) != std::get<1>(rhs)) {
+      return std::get<1>(lhs) > std::get<1>(rhs);
+    }
+    return std::get<2>(lhs) > std::get<2>(rhs);
+  });
+
+  const size_t window = std::max<size_t>(1, m_opts.publicationFetchWindow);
+  for (const auto& key : ready) {
+    if (inFlight >= window) {
+      break;
+    }
     if (m_fetchMap.find(key) == m_fetchMap.end())
       continue;
-    if (m_fetchingMap.find(key) != m_fetchingMap.end())
+    auto stateIt = m_publicationFetchStates.find(key);
+    if (stateIt == m_publicationFetchStates.end())
       continue;
-    m_fetchingMap[key] = true;
+    auto& state = stateIt->second;
+    if (state.status == PublicationFetchStatus::Fetching || state.nextAttempt > now)
+      continue;
 
     // Fetch first data packet
     const auto& [nodeId, bootstrapTime, seqNo] = key;
@@ -887,14 +1215,29 @@ SVSPubSub::fetchAll()
         NDN_LOG_TRACE("event=piggyback_cache_satisfy data=" << packet->getName()
                       << " node=" << nodeId
                       << " seq=" << seqNo);
+        observePublicationFetchSuccess(key);
         cleanUpFetch(key);
         continue;
       }
     }
     catch (const std::exception&) {
     }
+    state.status = PublicationFetchStatus::Fetching;
+    state.attemptStarted = now;
+    state.currentLifetime =
+      clampDuration(state.currentLifetime,
+                    m_opts.publicationFetchMinInterestLifetime,
+                    m_opts.publicationFetchMaxInterestLifetime);
+    ++state.attempts;
+    ++inFlight;
+    m_svsync.setFetchInterestLifetime(state.currentLifetime);
     m_svsync.fetchData(nodeId, bootstrapTime, seqNo,
-                       std::bind(&SVSPubSub::onSyncData, this, _1, key), 12);
+                       std::bind(&SVSPubSub::onSyncData, this, _1, key),
+                       [](auto&&...) {},
+	                       [this, key](const Interest&) {
+	                         markPublicationFetchFailed(key);
+	                       },
+	                       m_opts.publicationFetchInnerRetries);
   }
 }
 
@@ -906,9 +1249,10 @@ SVSPubSub::onSyncData(const Data& firstData, const PublicationKey& publication)
 
   // Make sure the data is encapsulated
   if (firstData.getContentType() != ndn::tlv::Data) {
-    m_fetchingMap[publication] = false;
+    markPublicationFetchFailed(publication);
     return;
   }
+  observePublicationFetchSuccess(publication);
 
   // Unwrap
   Data innerData(firstData.getContent().blockFromValue());
@@ -1036,7 +1380,7 @@ void
 SVSPubSub::cleanUpFetch(const PublicationKey& publication)
 {
   m_fetchMap.erase(publication);
-  m_fetchingMap.erase(publication);
+  m_publicationFetchStates.erase(publication);
 }
 
 bool
@@ -1108,11 +1452,16 @@ SVSPubSub::satisfyPendingFetchFromPiggyData(const Data& data)
 Block
 SVSPubSub::onGetExtraData(const VersionVector&)
 {
+  const auto totalStart = SteadyClock::now();
   std::lock_guard<std::mutex> lock(m_extraDataMutex);
+  const auto lockedAt = SteadyClock::now();
 
   MappingList includedMappings(m_notificationMappingList.nodeId);
   size_t mappingCount = 0;
+  size_t repeatedMappingCount = 0;
   size_t piggyCount = 0;
+  size_t repairCount = 0;
+  const auto mappingStart = SteadyClock::now();
   if (m_notificationMappingList.nodeId != EMPTY_NAME) {
     for (const auto& entry : m_notificationMappingList.pairs) {
       MappingList candidate = includedMappings;
@@ -1126,18 +1475,56 @@ SVSPubSub::onGetExtraData(const VersionVector&)
       // piggyback path; peers can still fetch them from MappingProvider.
     }
   }
+  const auto mappingDone = SteadyClock::now();
 
+  const auto initialEncodeStart = SteadyClock::now();
   ndn::Block block = includedMappings.encode();
   block.parse();
+  const auto initialEncodeDone = SteadyClock::now();
   size_t size = block.size();
   size_t retainedCount = 0;
   size_t expiredCount = 0;
+  size_t retainedMappingCount = 0;
+  size_t expiredMappingCount = 0;
+  size_t retainedRepairCount = 0;
+  size_t expiredRepairCount = 0;
+  std::deque<PiggyMappingEntry> retainedMappings;
+  const auto repeatedMappingStart = SteadyClock::now();
+  for (auto it = m_piggyMappingQueue.rbegin(); it != m_piggyMappingQueue.rend(); ++it) {
+    MappingList repairMapping(it->nodeId);
+    repairMapping.pairs.push_back(it->mapping);
+    auto mappingBlock = repairMapping.encode();
+    if (size + mappingBlock.size() > MAX_SIZE_OF_APPLICATION_PARAMETERS) {
+      ++it->missed;
+      if (it->missed < m_opts.piggybackMissLimit) {
+        retainedMappings.push_front(*it);
+        ++retainedMappingCount;
+      }
+      else {
+        ++expiredMappingCount;
+      }
+      continue;
+    }
+
+    block.push_back(mappingBlock);
+    size += mappingBlock.size();
+    ++repeatedMappingCount;
+    ++it->sent;
+    if (it->sent < m_opts.piggybackRepeatCount) {
+      retainedMappings.push_front(*it);
+      ++retainedMappingCount;
+    }
+  }
+  m_piggyMappingQueue = std::move(retainedMappings);
+  const auto repeatedMappingDone = SteadyClock::now();
+
   std::deque<PiggyDataEntry> retained;
+  const auto piggyStart = SteadyClock::now();
   for (auto it = m_piggyDataQueue.rbegin(); it != m_piggyDataQueue.rend(); ++it) {
     auto dataBlock = it->data.wireEncode();
     if (size + dataBlock.size() > MAX_SIZE_OF_APPLICATION_PARAMETERS) {
       ++it->missed;
-      if (it->missed < 3) {
+      if (it->missed < m_opts.piggybackMissLimit) {
         retained.push_front(*it);
         ++retainedCount;
       }
@@ -1153,17 +1540,73 @@ SVSPubSub::onGetExtraData(const VersionVector&)
     block.push_back(dataBlock);
     size += dataBlock.size();
     ++piggyCount;
+    ++it->sent;
+    if (it->sent < m_opts.piggybackRepeatCount) {
+      retained.push_front(*it);
+      ++retainedCount;
+    }
   }
   m_piggyDataQueue = std::move(retained);
+  const auto piggyDone = SteadyClock::now();
+
+  std::deque<RepairRequestEntry> retainedRepairs;
+  const auto repairStart = SteadyClock::now();
+  for (auto it = m_repairRequestQueue.rbegin(); it != m_repairRequestQueue.rend(); ++it) {
+    auto repairBlock = encodeRepairRequests({it->info});
+    if (size + repairBlock.size() > MAX_SIZE_OF_APPLICATION_PARAMETERS) {
+      ++it->missed;
+      if (it->missed < m_opts.piggybackMissLimit) {
+        retainedRepairs.push_front(*it);
+        ++retainedRepairCount;
+      }
+      else {
+        ++expiredRepairCount;
+      }
+      continue;
+    }
+
+    block.push_back(repairBlock);
+    size += repairBlock.size();
+    ++repairCount;
+    ++it->sent;
+    if (it->sent < m_opts.repairRequestRepeatCount) {
+      retainedRepairs.push_front(*it);
+      ++retainedRepairCount;
+    }
+  }
+  m_repairRequestQueue = std::move(retainedRepairs);
+  const auto repairDone = SteadyClock::now();
+
+  const auto finalEncodeStart = SteadyClock::now();
   block.encode();
+  const auto finalEncodeDone = SteadyClock::now();
 
   NDN_LOG_TRACE("event=piggyback_build mappings=" << mappingCount
+                << " repeated_mappings=" << repeatedMappingCount
                 << " data=" << piggyCount
+                << " repairs=" << repairCount
                 << " retained=" << retainedCount
                 << " expired=" << expiredCount
+                << " retained_mappings=" << retainedMappingCount
+                << " expired_mappings=" << expiredMappingCount
+                << " retained_repairs=" << retainedRepairCount
+                << " expired_repairs=" << expiredRepairCount
                 << " bytes=" << block.size()
                 << " appParamLimit=" << MAX_SIZE_OF_APPLICATION_PARAMETERS
                 << " piggyDataLimit=" << MAX_SIZE_OF_PIGGYDATA);
+  NDN_LOG_TRACE("event=extra_mapping_build_timing mappings=" << mappingCount
+                << " repeated_mappings=" << repeatedMappingCount
+                << " data=" << piggyCount
+                << " repairs=" << repairCount
+                << " bytes=" << block.size()
+                << " lock_wait_us=" << elapsedUs(totalStart, lockedAt)
+                << " mapping_select_us=" << elapsedUs(mappingStart, mappingDone)
+                << " initial_mapping_encode_us=" << elapsedUs(initialEncodeStart, initialEncodeDone)
+                << " repeated_mapping_pack_us=" << elapsedUs(repeatedMappingStart, repeatedMappingDone)
+                << " piggy_pack_us=" << elapsedUs(piggyStart, piggyDone)
+                << " repair_pack_us=" << elapsedUs(repairStart, repairDone)
+                << " final_encode_us=" << elapsedUs(finalEncodeStart, finalEncodeDone)
+                << " total_us=" << elapsedUs(totalStart, finalEncodeDone));
 
   m_notificationMappingList = MappingList();
 
@@ -1173,42 +1616,61 @@ SVSPubSub::onGetExtraData(const VersionVector&)
 void
 SVSPubSub::onRecvExtraData(const Block& block, const VersionVector&)
 {
+  const auto totalStart = SteadyClock::now();
   std::vector<PublicationKey> receivedMappings;
+  size_t topLevelMappings = 0;
+  uint64_t topLevelParseUs = 0;
   try {
     NDN_LOG_TRACE("event=piggyback_recv_block type=" << block.type()
                   << " bytes=" << block.size());
+    const auto parseStart = SteadyClock::now();
     MappingList list(block);
     for (const auto& entry : list.pairs) {
       m_mappingProvider.insertMapping(list.nodeId, entry.bootstrapTime, entry.seqNo, entry.mapping);
       receivedMappings.emplace_back(list.nodeId, entry.bootstrapTime, entry.seqNo);
     }
+    topLevelParseUs = elapsedUs(parseStart, SteadyClock::now());
+    topLevelMappings = list.pairs.size();
     NDN_LOG_TRACE("event=piggyback_recv_mapping_list node=" << list.nodeId
                   << " mappings=" << list.pairs.size());
   } catch (const std::exception& e) {
     NDN_LOG_TRACE("event=piggyback_recv_mapping_list_error error=" << e.what());
   }
 
+  size_t mappingCount = 0;
+  size_t dataCount = 0;
+  size_t repairRequestCount = 0;
+  uint64_t blockParseUs = 0;
+  uint64_t childMappingParseUs = 0;
+  uint64_t childDataParseUs = 0;
+  uint64_t childRepairParseUs = 0;
+  uint64_t childCacheUs = 0;
   try {
+    const auto blockParseStart = SteadyClock::now();
     block.parse();
-    size_t mappingCount = 0;
-    size_t dataCount = 0;
+    blockParseUs = elapsedUs(blockParseStart, SteadyClock::now());
     for (const auto& childBlock : block.elements()) {
       NDN_LOG_TRACE("event=piggyback_recv_child type=" << childBlock.type()
                     << " bytes=" << childBlock.size());
       if (childBlock.type() == ndn::svs::tlv::MappingData) {
+        const auto childMappingStart = SteadyClock::now();
         MappingList childList(childBlock);
         for (const auto& entry : childList.pairs) {
           m_mappingProvider.insertMapping(childList.nodeId, entry.bootstrapTime,
                                           entry.seqNo, entry.mapping);
           receivedMappings.emplace_back(childList.nodeId, entry.bootstrapTime, entry.seqNo);
         }
+        childMappingParseUs += elapsedUs(childMappingStart, SteadyClock::now());
         mappingCount += childList.pairs.size();
       }
 
       if (childBlock.type() == ndn::tlv::Data) {
+        const auto childDataStart = SteadyClock::now();
         ndn::Data data(childBlock);
         satisfyPendingFetchFromPiggyData(data);
+        childDataParseUs += elapsedUs(childDataStart, SteadyClock::now());
         try {
+          const auto cacheStart = SteadyClock::now();
           std::lock_guard<std::mutex> lock(m_extraDataMutex);
           const auto dataName = data.getName();
           if (m_piggyDataCache.find(dataName) == m_piggyDataCache.end()) {
@@ -1225,19 +1687,34 @@ SVSPubSub::onRecvExtraData(const Block& block, const VersionVector&)
             m_piggyDataCache.erase(m_piggyDataCacheOrder.front());
             m_piggyDataCacheOrder.pop_front();
           }
+          childCacheUs += elapsedUs(cacheStart, SteadyClock::now());
         }
         catch (const std::exception&) {
         }
         ++dataCount;
       }
+
+      if (childBlock.type() == ndn::svs::tlv::RepairData) {
+        const auto childRepairStart = SteadyClock::now();
+        for (const auto& request : decodeRepairRequests(childBlock)) {
+          const SeqNo high = std::max(request.high, request.low);
+          for (SeqNo seq = request.low; seq <= high; ++seq) {
+            enqueueRepairPublication(PublicationKey(request.nodeId, request.bootstrapTime, seq));
+            ++repairRequestCount;
+          }
+        }
+        childRepairParseUs += elapsedUs(childRepairStart, SteadyClock::now());
+      }
     }
     NDN_LOG_TRACE("event=piggyback_recv_children mappings=" << mappingCount
-                  << " data=" << dataCount);
+                  << " data=" << dataCount
+                  << " repairs=" << repairRequestCount);
   } catch (const std::exception&) {
   }
 
   bool queued = false;
   size_t processed = 0;
+  const auto processStart = SteadyClock::now();
   for (const auto& [nodeId, bootstrapTime, seqNo] : receivedMappings) {
     try {
       queued |= processMapping(nodeId, bootstrapTime, seqNo);
@@ -1246,6 +1723,7 @@ SVSPubSub::onRecvExtraData(const Block& block, const VersionVector&)
     catch (const std::exception&) {
     }
   }
+  const auto processDone = SteadyClock::now();
   if (queued) {
     fetchAll();
   }
@@ -1254,6 +1732,22 @@ SVSPubSub::onRecvExtraData(const Block& block, const VersionVector&)
                   << " received=" << receivedMappings.size()
                   << " queued=" << queued);
   }
+  NDN_LOG_TRACE("event=extra_mapping_recv_timing bytes=" << block.size()
+                << " top_level_mappings=" << topLevelMappings
+                << " child_mappings=" << mappingCount
+                << " child_data=" << dataCount
+                << " child_repairs=" << repairRequestCount
+                << " received_mappings=" << receivedMappings.size()
+                << " processed=" << processed
+                << " queued=" << queued
+                << " top_level_parse_us=" << topLevelParseUs
+                << " block_parse_us=" << blockParseUs
+                << " child_mapping_parse_us=" << childMappingParseUs
+                << " child_data_parse_us=" << childDataParseUs
+                << " child_repair_parse_us=" << childRepairParseUs
+                << " child_cache_us=" << childCacheUs
+                << " process_mapping_us=" << elapsedUs(processStart, processDone)
+                << " total_us=" << elapsedUs(totalStart, SteadyClock::now()));
 }
 
 } // namespace ndn::svs

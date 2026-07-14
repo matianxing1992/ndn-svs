@@ -24,6 +24,32 @@ __pycache__/
 # Visual Studio Code
 .vscode/
 
+# CodeGraph local index and runtime artifacts
+.codegraph/
+.codegraph-*/
+codegraph*.log
+codegraph*.tmp
+
+# Codex/agent workflow files and local planning artifacts
+AGENTS.md
+AGENTS.local.md
+CLAUDE.md
+CLAUDE.local.md
+CODEX.md
+CODEX.local.md
+.codex/
+.agents/
+.planning/
+.specify/
+specs/
+docs/
+context-mode*.log
+context-mode*.tmp
+gsd*.log
+gsd*.tmp
+speckit*.log
+speckit*.tmp
+
 # macOS
 .DS_Store
 .AppleDouble

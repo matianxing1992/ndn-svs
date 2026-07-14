@@ -199,7 +199,7 @@ SVSyncBase::fetchData(const NodeID& nid,
   Name interestName = getDataName(nid, bootstrapTime, seqNo);
   Interest interest(interestName);
   interest.setCanBePrefix(true);
-  interest.setInterestLifetime(2_s);
+  interest.setInterestLifetime(m_fetchInterestLifetime);
 
   m_fetcher.expressInterest(interest,
                             std::bind(&SVSyncBase::onDataValidated, this, _2, onValidated),

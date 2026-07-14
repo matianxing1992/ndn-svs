@@ -38,6 +38,13 @@ public:
                        int nRetries = 0,
                        const ndn::security::DataValidationFailureCallback& afterValidationFailed = nullptr);
 
+  void
+  setWindowSize(uint16_t windowSize)
+  {
+    m_windowSize = std::max<uint16_t>(1, windowSize);
+    processQueue();
+  }
+
 private:
   struct QueuedInterest;
 

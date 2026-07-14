@@ -7,6 +7,7 @@
  */
 
 #include "svspubsub.hpp"
+#include "tlv.hpp"
 
 #include "tests/boost-test.hpp"
 
@@ -30,6 +31,31 @@ runIoUntil(Face& face, const std::function<bool()>& done)
     face.getIoContext().run_for(10ms);
     std::this_thread::sleep_for(1ms);
   }
+}
+
+static void
+runIoFor(Face& face, time::milliseconds duration)
+{
+  auto deadline = std::chrono::steady_clock::now() +
+                  std::chrono::milliseconds(duration.count());
+  while (std::chrono::steady_clock::now() < deadline) {
+    face.getIoContext().restart();
+    face.getIoContext().run_for(10ms);
+    std::this_thread::sleep_for(1ms);
+  }
+}
+
+static size_t
+countChildBlocksOfType(Block block, uint32_t type)
+{
+  block.parse();
+  size_t count = 0;
+  for (const auto& child : block.elements()) {
+    if (child.type() == type) {
+      ++count;
+    }
+  }
+  return count;
 }
 
 BOOST_AUTO_TEST_SUITE(TestSVSPubSub)
@@ -198,6 +224,8 @@ BOOST_AUTO_TEST_CASE(MappingFetchSuppressesDuplicateInFlightRange)
                    [] (const std::vector<MissingDataInfo>&) {},
                    opts);
   pubsub.subscribe("/app", [] (const SVSPubSub::SubscriptionData&) {});
+  runIoFor(face, 5_ms);
+  face.sentInterests.clear();
 
   MissingDataInfo missing;
   missing.nodeId = "/offline";
@@ -206,12 +234,152 @@ BOOST_AUTO_TEST_CASE(MappingFetchSuppressesDuplicateInFlightRange)
   missing.high = 2;
 
   pubsub.updateCallbackInternal({missing});
+  runIoFor(face, 5_ms);
   BOOST_REQUIRE_EQUAL(face.sentInterests.size(), 1);
   const auto firstInterest = face.sentInterests.front().getName();
 
   pubsub.updateCallbackInternal({missing});
   BOOST_CHECK_EQUAL(face.sentInterests.size(), 1);
   BOOST_CHECK_EQUAL(face.sentInterests.front().getName(), firstInterest);
+}
+
+BOOST_AUTO_TEST_CASE(MappingFetchBackoffSuppressesRetryAfterTimeout)
+{
+  DummyClientFace face;
+  SVSPubSubOptions opts;
+  opts.useTimestamp = false;
+  opts.mappingFetchRetries = 0;
+  opts.mappingFetchFailureBackoff = 30_s;
+
+  SVSPubSub pubsub("/sync", "/local", face,
+                   [] (const std::vector<MissingDataInfo>&) {},
+                   opts);
+  pubsub.subscribe("/app", [] (const SVSPubSub::SubscriptionData&) {});
+  runIoFor(face, 5_ms);
+  face.sentInterests.clear();
+
+  MissingDataInfo missing;
+  missing.nodeId = "/offline";
+  missing.bootstrapTime = 400;
+  missing.low = 1;
+  missing.high = 2;
+
+  pubsub.updateCallbackInternal({missing});
+  runIoFor(face, 5_ms);
+  BOOST_REQUIRE_EQUAL(face.sentInterests.size(), 1);
+
+  runIoFor(face, 2500_ms);
+  pubsub.updateCallbackInternal({missing});
+  BOOST_CHECK_EQUAL(face.sentInterests.size(), 1);
+}
+
+BOOST_AUTO_TEST_CASE(SmallDataIsPiggybackedAcrossMultipleRounds)
+{
+  DummyClientFace face;
+  SVSPubSubOptions opts;
+  opts.useTimestamp = false;
+  opts.piggybackRepeatCount = 2;
+
+  SVSPubSub pubsub("/sync", "/local", face,
+                   [] (const std::vector<MissingDataInfo>&) {},
+                   opts);
+
+  const std::string payload = "repeat";
+  pubsub.publish("/app/repeat",
+                 make_span(reinterpret_cast<const uint8_t*>(payload.data()), payload.size()));
+
+  auto first = pubsub.onGetExtraData(VersionVector());
+  auto second = pubsub.onGetExtraData(VersionVector());
+  auto third = pubsub.onGetExtraData(VersionVector());
+
+  BOOST_CHECK_GE(countChildBlocksOfType(first, ndn::tlv::Data), 1);
+  BOOST_CHECK_GE(countChildBlocksOfType(second, ndn::tlv::Data), 1);
+  BOOST_CHECK_EQUAL(countChildBlocksOfType(third, ndn::tlv::Data), 0);
+}
+
+BOOST_AUTO_TEST_CASE(PublicationFetchTimeoutBacksOffAndIncreasesLifetime)
+{
+  DummyClientFace face;
+  SVSPubSubOptions opts;
+  opts.useTimestamp = false;
+  opts.publicationFetchRetries = 1;
+  opts.publicationFetchInnerRetries = 0;
+  opts.publicationFetchWindow = 1;
+  opts.publicationFetchInterestLifetime = 50_ms;
+  opts.publicationFetchMinInterestLifetime = 50_ms;
+  opts.publicationFetchMaxInterestLifetime = 400_ms;
+  opts.publicationFetchFailureBackoff = 10_ms;
+  opts.publicationFetchMaxBackoff = 100_ms;
+
+  SVSPubSub pubsub("/sync", "/local", face,
+                   [] (const std::vector<MissingDataInfo>&) {},
+                   opts);
+  pubsub.subscribe("/app/item", [] (const SVSPubSub::SubscriptionData&) {});
+  runIoFor(face, 5_ms);
+  face.sentInterests.clear();
+
+  BootstrapTime bootstrapTime = 500;
+  pubsub.insertMapping("/peer", bootstrapTime, 1, "/app/item", {});
+  BOOST_CHECK(pubsub.processMapping("/peer", bootstrapTime, 1));
+  pubsub.fetchAll();
+  runIoFor(face, 5_ms);
+  auto getPublicationInterests = [&face] {
+    std::vector<const Interest*> result;
+    for (const auto& interest : face.sentInterests) {
+      if (Name("/peer").isPrefixOf(interest.getName())) {
+        result.push_back(&interest);
+      }
+    }
+    return result;
+  };
+  auto publicationInterests = getPublicationInterests();
+  BOOST_REQUIRE_EQUAL(publicationInterests.size(), 1);
+  BOOST_CHECK_EQUAL(publicationInterests.back()->getInterestLifetime(), 50_ms);
+
+  runIoFor(face, 90_ms);
+  publicationInterests = getPublicationInterests();
+  BOOST_REQUIRE_GE(publicationInterests.size(), 2);
+  BOOST_CHECK_EQUAL(publicationInterests.back()->getInterestLifetime(), 100_ms);
+}
+
+BOOST_AUTO_TEST_CASE(RepairRequestRepiggybacksProducerData)
+{
+  DummyClientFace producerFace;
+  SVSPubSubOptions producerOpts;
+  producerOpts.useTimestamp = false;
+  producerOpts.piggybackRepeatCount = 1;
+  producerOpts.repairRequestRepeatCount = 1;
+
+  SVSPubSub producer("/sync", "/producer", producerFace,
+                     [] (const std::vector<MissingDataInfo>&) {},
+                     producerOpts);
+
+  const std::string payload = "repair";
+  auto seq = producer.publish("/app/repair",
+                              make_span(reinterpret_cast<const uint8_t*>(payload.data()),
+                                        payload.size()));
+  auto bootstrapTime = producer.getSVSync().getCore().getBootstrapTime();
+
+  // Drain the initial one-shot piggyback so the later Data comes from repair.
+  producer.onGetExtraData(VersionVector());
+  BOOST_CHECK_EQUAL(countChildBlocksOfType(producer.onGetExtraData(VersionVector()),
+                                           ndn::tlv::Data), 0);
+
+  DummyClientFace receiverFace;
+  SVSPubSubOptions receiverOpts;
+  receiverOpts.useTimestamp = false;
+  receiverOpts.repairRequestRepeatCount = 1;
+  SVSPubSub receiver("/sync", "/receiver", receiverFace,
+                     [] (const std::vector<MissingDataInfo>&) {},
+                     receiverOpts);
+
+  receiver.rememberRepairRequest(SVSPubSub::PublicationKey("/producer", bootstrapTime, seq));
+  auto repairBlock = receiver.onGetExtraData(VersionVector());
+  BOOST_CHECK_GE(countChildBlocksOfType(repairBlock, ndn::svs::tlv::RepairData), 1);
+
+  producer.onRecvExtraData(repairBlock, VersionVector());
+  auto repaired = producer.onGetExtraData(VersionVector());
+  BOOST_CHECK_GE(countChildBlocksOfType(repaired, ndn::tlv::Data), 1);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

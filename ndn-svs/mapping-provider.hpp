@@ -106,6 +106,12 @@ public:
                         const TimeoutCallback& onTimeout,
                         int nRetries = 0);
 
+  void
+  setFetchWindowSize(uint16_t windowSize)
+  {
+    m_fetcher.setWindowSize(windowSize);
+  }
+
 private:
   /**
    * @brief Return data name for mapping query
