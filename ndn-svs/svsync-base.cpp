@@ -135,8 +135,70 @@ SVSyncBase::insertPreparedData(const Data& data, bool putToFace)
 }
 
 void
+SVSyncBase::insertPreparedDataBatch(const std::vector<Data>& packets)
+{
+  if (!packets.empty() && !m_dataStore->supportsErase()) {
+    throw std::logic_error("DataStore does not support transactional rollback");
+  }
+
+  // Force every final encoding before the first irreversible store mutation.
+  for (const auto& packet : packets) {
+    if (packet.wireEncode().size() > MAX_NDN_PACKET_SIZE) {
+      throw std::length_error("prepared SVS Data exceeds MAX_NDN_PACKET_SIZE");
+    }
+  }
+
+  std::vector<Name> inserted;
+  inserted.reserve(packets.size());
+  try {
+    std::lock_guard<std::mutex> lock(m_dataStoreMutex);
+    for (const auto& packet : packets) {
+      // ndn-cxx InMemoryStorage obtains Data::shared_from_this() during
+      // insertion, so the exact object passed here must have a shared owner.
+      auto ownedPacket = std::make_shared<Data>(packet);
+      m_dataStore->insert(*ownedPacket);
+      inserted.push_back(packet.getName());
+    }
+  }
+  catch (...) {
+    auto insertionFailure = std::current_exception();
+    try {
+      std::lock_guard<std::mutex> lock(m_dataStoreMutex);
+      for (auto it = inserted.rbegin(); it != inserted.rend(); ++it) {
+        m_dataStore->erase(*it);
+      }
+    }
+    catch (...) {
+      throw std::runtime_error("DataStore rollback failed after partial insertion");
+    }
+    std::rethrow_exception(insertionFailure);
+  }
+}
+
+bool
+SVSyncBase::removePreparedDataBatch(const std::vector<Data>& packets) noexcept
+{
+  try {
+    if (!packets.empty() && !m_dataStore->supportsErase()) {
+      return false;
+    }
+    std::lock_guard<std::mutex> lock(m_dataStoreMutex);
+    for (auto it = packets.rbegin(); it != packets.rend(); ++it) {
+      m_dataStore->erase(it->getName());
+    }
+    return true;
+  }
+  catch (...) {
+    return false;
+  }
+}
+
+void
 SVSyncBase::putPreparedData(const Data& data)
 {
+  if (m_preparedDataPutHook) {
+    m_preparedDataPutHook(data);
+  }
   m_face.put(data);
 }
 

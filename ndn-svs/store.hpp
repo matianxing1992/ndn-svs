@@ -29,6 +29,24 @@ public:
   virtual std::shared_ptr<const Data> find(const Interest& interest) = 0;
 
   virtual void insert(const Data& data) = 0;
+
+  /** @brief Whether exact-name rollback is implemented by this store. */
+  virtual bool supportsErase() const noexcept
+  {
+    return false;
+  }
+
+  /**
+   * @brief Remove one exact Data name when a multi-packet publication rolls back.
+   *
+   * Custom stores that support publication transactions should override this.
+   * The default keeps source compatibility; callers verify that all fallible
+   * encoding/signing work has completed before insertion.
+   */
+  virtual void erase(const Name& name)
+  {
+    throw std::logic_error("DataStore exact-name erase is unsupported");
+  }
 };
 
 } // namespace ndn::svs

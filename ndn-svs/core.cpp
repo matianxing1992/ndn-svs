@@ -864,18 +864,31 @@ SVSyncCore::schedulePublicationSync()
 void
 SVSyncCore::sendLocalPublicationSyncInterest()
 {
-  {
-    std::lock_guard<std::mutex> lock(m_recordedVvMutex);
-    m_recordedVv = nullptr;
+  try {
+    if (m_localPublicationSyncHook) {
+      m_localPublicationSyncHook();
+    }
+    {
+      std::lock_guard<std::mutex> lock(m_recordedVvMutex);
+      m_recordedVv = nullptr;
+    }
+
+    sendSyncInterest();
+
+    unsigned int delay = m_retxDist(m_rng);
+    std::lock_guard<std::mutex> lock(m_schedulerMutex);
+    m_nextSyncInterest = getCurrentTime() + 1000 * delay;
+    m_retxEvent = m_scheduler.schedule(time::milliseconds(delay),
+                                       [this] { retxSyncInterest(true, 0); });
   }
-
-  sendSyncInterest();
-
-  unsigned int delay = m_retxDist(m_rng);
-  std::lock_guard<std::mutex> lock(m_schedulerMutex);
-  m_nextSyncInterest = getCurrentTime() + 1000 * delay;
-  m_retxEvent = m_scheduler.schedule(time::milliseconds(delay),
-                                     [this] { retxSyncInterest(true, 0); });
+  catch (const std::exception& e) {
+    NDN_LOG_ERROR("event=local_publication_sync_send_failed node=" << m_id
+                  << " error=" << e.what());
+  }
+  catch (...) {
+    NDN_LOG_ERROR("event=local_publication_sync_send_failed node=" << m_id
+                  << " error=unknown");
+  }
 }
 
 void
@@ -1243,11 +1256,21 @@ SVSyncCore::updateSeqNo(const SeqNo& seq, BootstrapTime bootstrapTime, const Nod
 
   if (seq > prev)
   {
-    if (m_syncInterestBatching.load(std::memory_order_relaxed)) {
-      schedulePublicationSync();
+    try {
+      if (m_syncInterestBatching.load(std::memory_order_relaxed)) {
+        schedulePublicationSync();
+      }
+      else {
+        sendLocalPublicationSyncInterest();
+      }
     }
-    else {
-      sendLocalPublicationSyncInterest();
+    catch (const std::exception& e) {
+      NDN_LOG_ERROR("event=local_publication_sync_send_failed node=" << t_nid
+                    << " seq=" << seq << " error=" << e.what());
+    }
+    catch (...) {
+      NDN_LOG_ERROR("event=local_publication_sync_send_failed node=" << t_nid
+                    << " seq=" << seq << " error=unknown");
     }
   }
 }

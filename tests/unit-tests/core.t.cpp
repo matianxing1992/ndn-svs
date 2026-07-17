@@ -76,6 +76,14 @@ makeFixtureV3Interest(const Name& syncPrefix, const std::string& relativePath)
   return interest;
 }
 
+static VersionVector
+getSyncInterestVector(const Interest& interest)
+{
+  auto params = interest.getApplicationParameters();
+  params.parse();
+  return VersionVector::decodeV2(params.get(ndn::svs::tlv::StateVector));
+}
+
 static void
 runIoUntil(Face& face, const std::function<bool()>& done)
 {
@@ -350,6 +358,153 @@ BOOST_AUTO_TEST_CASE(ComputeMergeStateVectorKeepsRestartEpochsSeparate)
   BOOST_CHECK_EQUAL(result.missingData[0].high, 1);
 }
 
+BOOST_AUTO_TEST_CASE(ParallelSyncInterestHandling)
+{
+  m_core.setParallelSyncProcessing(true, 2, 16);
+
+  VersionVector remote;
+  remote.set("peer", 300, 3);
+  m_core.onSyncInterestValidated(makeSyncInterest(m_syncPrefix, remote));
+
+  runIoUntil(m_face, [this] {
+    auto stats = m_core.getSyncProcessingStats();
+    return stats.syncJobsCompleted >= 1 || stats.syncJobsStale >= 1;
+  });
+
+  auto stats = m_core.getSyncProcessingStats();
+  BOOST_CHECK_EQUAL(stats.syncJobsSubmitted, 1);
+  BOOST_CHECK_EQUAL(stats.syncJobsDropped, 0);
+  BOOST_CHECK_EQUAL(m_core.getSeqNo("peer"), 3);
+}
+
+BOOST_AUTO_TEST_CASE(ParallelSyncInterestStressAndStaleFallback)
+{
+  m_core.setParallelSyncProcessing(true, 2, 32);
+
+  VersionVector staleRemote;
+  staleRemote.set("stale-peer", 100, 1);
+  m_core.onSyncInterestValidated(makeSyncInterest(m_syncPrefix, staleRemote));
+  m_core.updateSeqNo(1, "local-node");
+
+  for (uint64_t seq = 1; seq <= 20; ++seq) {
+    VersionVector remote;
+    remote.set("peer", 300, seq);
+    m_core.onSyncInterestValidated(makeSyncInterest(m_syncPrefix, remote));
+  }
+
+  runIoUntil(m_face, [this] {
+    auto stats = m_core.getSyncProcessingStats();
+    return stats.syncJobsCompleted + stats.syncJobsStale >= stats.syncJobsSubmitted;
+  });
+
+  auto stats = m_core.getSyncProcessingStats();
+  BOOST_CHECK_EQUAL(stats.syncJobsDropped, 0);
+  BOOST_CHECK_GE(stats.syncJobsSubmitted, 21);
+  BOOST_CHECK_GE(stats.syncJobsStale, 1);
+  BOOST_CHECK_EQUAL(m_core.getSeqNo("peer"), 20);
+  BOOST_CHECK_EQUAL(m_core.getSeqNo("local-node"), 1);
+}
+
+BOOST_AUTO_TEST_CASE(PublicationSyncBatchingCoalescesLocalUpdates)
+{
+  m_core.setSyncInterestBatching(true, 20_ms);
+  m_core.sendInitialInterest();
+
+  runIoUntil(m_face, [this] {
+    return !m_face.sentInterests.empty();
+  });
+  const auto baselineInterestCount = m_face.sentInterests.size();
+
+  for (uint64_t seq = 1; seq <= 10; ++seq) {
+    m_core.updateSeqNo(seq, "local-node");
+  }
+
+  m_face.getIoContext().restart();
+  m_face.getIoContext().run_for(std::chrono::milliseconds(5));
+  BOOST_CHECK_EQUAL(m_face.sentInterests.size(), baselineInterestCount);
+
+  runIoUntil(m_face, [this, baselineInterestCount] {
+    return m_face.sentInterests.size() > baselineInterestCount;
+  });
+
+  BOOST_REQUIRE_EQUAL(m_face.sentInterests.size(), baselineInterestCount + 1);
+  VersionVector sentVector = getSyncInterestVector(m_face.sentInterests.back());
+  BOOST_CHECK_EQUAL(sentVector.get("local-node"), 10);
+}
+
+BOOST_AUTO_TEST_CASE(PublicationSyncSendFailurePreservesCommittedLocalVersion)
+{
+  size_t hookCalls = 0;
+  m_core.setLocalPublicationSyncHookForTest([&] {
+    ++hookCalls;
+    throw std::runtime_error("injected post-commit Sync send failure");
+  });
+
+  BOOST_CHECK_NO_THROW(m_core.updateSeqNo(1, "local-node"));
+  BOOST_CHECK_EQUAL(hookCalls, 1);
+  BOOST_CHECK_EQUAL(m_core.getSeqNo("local-node"), 1);
+
+  m_core.setLocalPublicationSyncHookForTest({});
+  BOOST_CHECK_NO_THROW(m_core.updateSeqNo(2, "local-node"));
+  BOOST_CHECK_EQUAL(m_core.getSeqNo("local-node"), 2);
+
+  m_core.setSyncInterestBatching(true, 1_ms);
+  m_core.setLocalPublicationSyncHookForTest([&] {
+    ++hookCalls;
+    throw std::runtime_error("injected batched post-commit Sync send failure");
+  });
+  BOOST_CHECK_NO_THROW(m_core.updateSeqNo(3, "local-node"));
+  runIoUntil(m_face, [&] { return hookCalls == 2; });
+  BOOST_CHECK_EQUAL(hookCalls, 2);
+  BOOST_CHECK_EQUAL(m_core.getSeqNo("local-node"), 3);
+}
+
+BOOST_AUTO_TEST_CASE(ParallelSyncProductionHandling)
+{
+  m_core.setParallelSyncProduction(true, 2, 16);
+  m_core.sendInitialInterest();
+
+  runIoUntil(m_face, [this] {
+    return !m_face.sentInterests.empty();
+  });
+  const auto baselineInterestCount = m_face.sentInterests.size();
+
+  m_core.updateSeqNo(1, "local-node");
+
+  runIoUntil(m_face, [this, baselineInterestCount] {
+    auto stats = m_core.getSyncProcessingStats();
+    return m_face.sentInterests.size() > baselineInterestCount ||
+           stats.syncProductionJobsDropped > 0 ||
+           stats.syncProductionJobsStale > 0;
+  });
+
+  auto stats = m_core.getSyncProcessingStats();
+  BOOST_CHECK_EQUAL(stats.syncProductionJobsDropped, 0);
+  BOOST_CHECK_GE(stats.syncProductionJobsSubmitted, 1);
+  BOOST_CHECK_GE(stats.syncProductionJobsCompleted, 1);
+  BOOST_REQUIRE_EQUAL(m_face.sentInterests.size(), baselineInterestCount + 1);
+
+  VersionVector sentVector = getSyncInterestVector(m_face.sentInterests.back());
+  BOOST_CHECK_EQUAL(sentVector.get("local-node"), 1);
+}
+
+BOOST_AUTO_TEST_CASE(ParallelSyncProductionDropsStaleResult)
+{
+  m_core.setParallelSyncProduction(true, 1, 16);
+  m_core.sendInitialInterest();
+  m_core.updateSeqNo(1, "local-node");
+
+  runIoUntil(m_face, [this] {
+    auto stats = m_core.getSyncProcessingStats();
+    return stats.syncProductionJobsSubmitted >= 1 &&
+           stats.syncProductionJobsCompleted + stats.syncProductionJobsStale +
+             stats.syncProductionJobsDropped >= 1;
+  });
+
+  auto stats = m_core.getSyncProcessingStats();
+  BOOST_CHECK_EQUAL(stats.syncProductionJobsDropped, 0);
+  BOOST_CHECK_GE(stats.syncProductionJobsSubmitted, 1);
+}
 BOOST_AUTO_TEST_CASE(SyncInterestMissingDataCarriesBootstrapTimeInCallback)
 {
   DummyClientFace localFace;
