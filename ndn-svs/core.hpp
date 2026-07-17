@@ -25,7 +25,10 @@
 #include <ndn-cxx/util/scheduler.hpp>
 
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
+#include <queue>
+#include <thread>
 
 namespace ndn::svs {
 
@@ -77,6 +80,51 @@ public:
              const UpdateCallback& onUpdate,
              const SecurityOptions& securityOptions = SecurityOptions::DEFAULT,
              const NodeID& nid = EMPTY_NODE_ID);
+
+  ~SVSyncCore();
+
+  struct SyncProcessingStats
+  {
+    uint64_t syncJobsSubmitted = 0;
+    uint64_t syncJobsCompleted = 0;
+    uint64_t syncJobsDropped = 0;
+    uint64_t syncJobsStale = 0;
+    uint64_t syncWorkerQueueDepth = 0;
+    uint64_t syncWorkerProcessingMs = 0;
+    uint64_t syncMainThreadPublishMs = 0;
+    uint64_t syncInterestSerialHandlerMs = 0;
+    uint64_t syncInterestParallelTotalMs = 0;
+    uint64_t syncInterestMainThreadBlockingMs = 0;
+  };
+
+  void
+  setParallelSyncProcessing(bool enabled, size_t workerThreads = 1,
+                            size_t maxQueueSize = 1024);
+
+  /**
+   * @brief Experimentally coalesce locally triggered sync interests.
+   *
+   * This only delays sync interests triggered by local publication
+   * updateSeqNo() calls. Sync interests needed for reply/suppression and the
+   * wire format are unchanged.
+   */
+  void
+  setSyncInterestBatching(bool enabled,
+                          time::milliseconds window = 5_ms);
+
+  /**
+   * @brief Set the periodic Sync Interest retransmission interval.
+   *
+   * This is a diagnostic/testing override. Production and benchmark runs should
+   * normally keep the library default because this timer affects piggyback
+   * opportunities. Values below 1 ms are clamped to 1 ms.
+   */
+  void
+  setPeriodicSyncTime(time::milliseconds interval,
+                      double jitter = 0.1);
+
+  SyncProcessingStats
+  getSyncProcessingStats() const;
 
   /**
    * @brief Reset the sync tree (and restart synchronization again)
@@ -158,6 +206,10 @@ public:
 
   void onSyncInterestValidated(const Interest& interest);
 
+  void
+  onSyncInterestValidatedSerial(const Interest& interest,
+                                bool countSerialStats = true);
+
   /**
    * @brief Mark the instance as initialized and send the first interest
    */
@@ -197,6 +249,18 @@ public:
    */
   MergeResult mergeStateVector(const VersionVector& vvOther);
 
+  struct MergeComputationResult
+  {
+    bool myVectorNew = false;
+    bool otherVectorNew = false;
+    std::vector<MissingDataInfo> missingData;
+    VersionVector mergedVector;
+  };
+
+  static MergeComputationResult
+  computeMergeStateVector(const VersionVector& localVector,
+                          const VersionVector& remoteVector);
+
   /**
    * @brief Record vector by merging it into m_recordedVv
    * @param vvOther state vector to merge in
@@ -226,6 +290,19 @@ public:
   static inline const NodeID EMPTY_NODE_ID;
 
 private:
+  struct SyncProcessingJob;
+  struct SyncProcessingResult;
+  class SyncWorkerPool;
+
+  void
+  processSyncInterestResult(SyncProcessingResult result);
+
+  void
+  schedulePublicationSync();
+
+  void
+  incrementStat(std::atomic<uint64_t>& counter, uint64_t value = 1) const;
+
   // Communication
   ndn::Face& m_face;
   const Name m_syncPrefix;
@@ -238,6 +315,7 @@ private:
   // State
   VersionVector m_vv;
   mutable std::mutex m_vvMutex;
+  uint64_t m_stateGeneration = 0;
   // Aggregates incoming vectors while in suppression state
   std::unique_ptr<VersionVector> m_recordedVv = nullptr;
   mutable std::mutex m_recordedVvMutex;
@@ -270,12 +348,30 @@ private:
   mutable std::mutex m_schedulerMutex;
   scheduler::ScopedEventId m_retxEvent;
   scheduler::ScopedEventId m_packetEvent;
+  scheduler::ScopedEventId m_publicationSyncEvent;
+  bool m_publicationSyncPending = false;
 
   // Time at which the next sync interest will be sent
   std::atomic_long m_nextSyncInterest;
 
   // Prevent sending interests before initialization
   bool m_initialized = false;
+  std::atomic<bool> m_syncInterestBatching{false};
+  time::milliseconds m_syncInterestBatchWindow = 5_ms;
+
+  std::atomic<bool> m_parallelSyncProcessing{false};
+  std::shared_ptr<std::atomic<bool>> m_syncProcessingAlive;
+  std::unique_ptr<SyncWorkerPool> m_syncWorkerPool;
+  std::atomic<uint64_t> m_syncJobsSubmitted{0};
+  std::atomic<uint64_t> m_syncJobsCompleted{0};
+  std::atomic<uint64_t> m_syncJobsDropped{0};
+  std::atomic<uint64_t> m_syncJobsStale{0};
+  std::atomic<uint64_t> m_syncWorkerQueueDepth{0};
+  std::atomic<uint64_t> m_syncWorkerProcessingMs{0};
+  std::atomic<uint64_t> m_syncMainThreadPublishMs{0};
+  std::atomic<uint64_t> m_syncInterestSerialHandlerMs{0};
+  std::atomic<uint64_t> m_syncInterestParallelTotalMs{0};
+  std::atomic<uint64_t> m_syncInterestMainThreadBlockingMs{0};
 };
 
 } // namespace ndn::svs
