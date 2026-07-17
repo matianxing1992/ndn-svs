@@ -15,14 +15,17 @@
  */
 
 #include "svspubsub.hpp"
+#include "tlv.hpp"
 
 #include <ndn-cxx/util/segment-fetcher.hpp>
+#include <ndn-cxx/util/logger.hpp>
 
+#include <algorithm>
 #include <chrono>
 
-
-
 namespace ndn::svs {
+
+NDN_LOG_INIT(ndn_svs.SVSPubSub);
 
 SVSPubSub::SVSPubSub(const Name& syncPrefix,
                      const Name& nodePrefix,
@@ -46,10 +49,12 @@ SVSPubSub::SVSPubSub(const Name& syncPrefix,
   , m_mappingProvider(syncPrefix, nodePrefix, face, securityOptions,
                       options.syncProtocol.version)
   , m_notificationMappingList(options.syncProtocol.version)
+  , m_maxApplicationParametersSize(std::max<size_t>(1, options.maxApplicationParametersSize))
+  , m_maxPiggyDataSize(std::max<size_t>(1, options.maxPiggyDataSize))
+  , m_piggyDataCacheLimit(std::max<size_t>(1, options.piggyDataCacheLimit))
 {
   m_svsync.getCore().setGetExtraBlockCallback(std::bind(&SVSPubSub::onGetExtraData, this, _1));
-  m_svsync.getCore().setRecvExtraBlockCallback(
-    std::bind(&SVSPubSub::onRecvExtraData, this, _1, _2));
+  m_svsync.getCore().setRecvExtraBlockCallback(std::bind(&SVSPubSub::onRecvExtraData, this, _1, _2));
 }
 
 SeqNo
@@ -95,6 +100,17 @@ SVSPubSub::publish(const Name& name,
     data.setContent(value);
     data.setFreshnessPeriod(freshnessPeriod);
     m_securityOptions.dataSigner->sign(data);
+    // If the data is within the configured limit, add it to the piggyback queue.
+    const auto wireSize = data.wireEncode().size();
+    if (wireSize <= m_maxPiggyDataSize) {
+      std::lock_guard<std::mutex> lock(m_extraDataMutex);
+      m_piggyDataQueue.push_back({data, 0});
+    }
+    else {
+      NDN_LOG_TRACE("event=piggyback_skip reason=data_too_large bytes=" << wireSize
+                    << " limit=" << m_maxPiggyDataSize
+                    << " data=" << data.getName());
+    }
     return publishPacket(data, nodePrefix);
   }
 }
@@ -166,7 +182,7 @@ uint32_t
 SVSPubSub::subscribeWithRegex(const Regex &regex, const SubscriptionCallback &callback,bool autofetch, bool packets)
 {
   uint32_t handle = ++m_subscriptionCount;
-  Subscription sub = { handle, ndn::Name(), callback, packets, false, autofetch, make_shared<Regex>(regex)};
+  Subscription sub = { handle, ndn::Name(), callback, packets, false, autofetch, std::make_shared<Regex>(regex)};
   m_regexSubscriptions.push_back(sub);
   return handle;
 }
@@ -269,6 +285,11 @@ SVSPubSub::updateCallbackInternal(const std::vector<MissingDataInfo>& info)
 bool
 SVSPubSub::processMapping(const NodeID& nodeId, BootstrapTime bootstrapTime, SeqNo seqNo)
 {
+  const PublicationKey publication(nodeId, bootstrapTime, seqNo);
+  if (hasPiggyDeliveredPublication(publication)) {
+    return false;
+  }
+
   // this will throw if mapping not found
   auto mapping = m_mappingProvider.getMapping(nodeId, bootstrapTime, seqNo);
 
@@ -287,16 +308,38 @@ SVSPubSub::processMapping(const NodeID& nodeId, BootstrapTime bootstrapTime, Seq
     }
   }
 
-  // check if known mapping matches subscription
   bool queued = false;
-  for (const auto& sub : m_prefixSubscriptions) {
-    if (!sub.prefix.isPrefixOf(mapping.first)) {
-      continue;
-    }
-
+  bool deliveredFromPiggy = false;
+  auto queueOrDeliver = [this, &queued, &deliveredFromPiggy, &mapping, &publication,
+                         &nodeId, seqNo](const Subscription& sub) {
     if (sub.autofetch) {
-      m_fetchMap[PublicationKey(nodeId, bootstrapTime, seqNo)].push_back(sub);
-      queued = true;
+      std::optional<Data> packet;
+      {
+        std::lock_guard<std::mutex> lock(m_extraDataMutex);
+        auto data = m_piggyDataCache.lower_bound(mapping.first);
+        auto exactData = m_piggyDataCache.find(mapping.first);
+        if (exactData != m_piggyDataCache.end()) {
+          packet = exactData->second;
+        }
+        else if (data != m_piggyDataCache.end() && mapping.first.isPrefixOf(data->first)) {
+          packet = data->second;
+        }
+      }
+      if (packet) {
+        SubscriptionData subData = {
+          mapping.first,
+          packet->getContent().value_bytes(),
+          nodeId,
+          seqNo,
+          packet
+        };
+        sub.callback(subData);
+        deliveredFromPiggy = true;
+      }
+      else {
+        m_fetchMap[publication].push_back(sub);
+        queued = true;
+      }
     }
     else {
       SubscriptionData subData = {
@@ -307,27 +350,23 @@ SVSPubSub::processMapping(const NodeID& nodeId, BootstrapTime bootstrapTime, Seq
         std::nullopt
       };
       sub.callback(subData);
+    }
+  };
+
+  // check if known mapping matches subscription
+  for (const auto& sub : m_prefixSubscriptions) {
+    if (sub.prefix.isPrefixOf(mapping.first)) {
+      queueOrDeliver(sub);
     }
   }
   for (const auto& sub : m_regexSubscriptions) {
-    if (!sub.regex->match(mapping.first)) {
-      continue;
+    if (sub.regex->match(mapping.first)) {
+      queueOrDeliver(sub);
     }
+  }
 
-    if (sub.autofetch) {
-      m_fetchMap[PublicationKey(nodeId, bootstrapTime, seqNo)].push_back(sub);
-      queued = true;
-    }
-    else {
-      SubscriptionData subData = {
-        mapping.first,
-        ndn::span<const uint8_t>{},
-        nodeId,
-        seqNo,
-        std::nullopt
-      };
-      sub.callback(subData);
-    }
+  if (deliveredFromPiggy) {
+    rememberPiggyDeliveredPublication(publication);
   }
 
   return queued;
@@ -336,15 +375,56 @@ SVSPubSub::processMapping(const NodeID& nodeId, BootstrapTime bootstrapTime, Seq
 void
 SVSPubSub::fetchAll()
 {
+  using PendingFetchKey = decltype(m_fetchMap)::key_type;
+  std::vector<PendingFetchKey> pendingFetches;
+  pendingFetches.reserve(m_fetchMap.size());
   for (const auto& pair : m_fetchMap) {
-    // Check if already fetching this publication
-    auto key = pair.first;
+    pendingFetches.push_back(pair.first);
+  }
+
+  for (const auto& key : pendingFetches) {
+    if (m_fetchMap.find(key) == m_fetchMap.end())
+      continue;
     if (m_fetchingMap.find(key) != m_fetchingMap.end())
       continue;
     m_fetchingMap[key] = true;
 
     // Fetch first data packet
     const auto& [nodeId, bootstrapTime, seqNo] = key;
+    try {
+      const auto mapping = m_mappingProvider.getMapping(nodeId, bootstrapTime, seqNo);
+      std::optional<Data> packet;
+      {
+        std::lock_guard<std::mutex> lock(m_extraDataMutex);
+        auto data = m_piggyDataCache.lower_bound(mapping.first);
+        auto exactData = m_piggyDataCache.find(mapping.first);
+        if (exactData != m_piggyDataCache.end()) {
+          packet = exactData->second;
+        }
+        else if (data != m_piggyDataCache.end() && mapping.first.isPrefixOf(data->first)) {
+          packet = data->second;
+        }
+      }
+      if (packet) {
+        SubscriptionData subData = {
+          mapping.first,
+          packet->getContent().value_bytes(),
+          nodeId,
+          seqNo,
+          packet,
+        };
+        for (const auto& sub : m_fetchMap[key]) {
+          sub.callback(subData);
+        }
+        rememberPiggyDeliveredPublication(key);
+        NDN_LOG_TRACE("event=piggyback_cache_satisfy data=" << packet->getName()
+                      << " node=" << nodeId << " seq=" << seqNo);
+        cleanUpFetch(key);
+        continue;
+      }
+    }
+    catch (const std::exception&) {
+    }
     m_svsync.fetchData(nodeId, bootstrapTime, seqNo,
                        std::bind(&SVSPubSub::onSyncData, this, _1, key), 12);
   }
@@ -491,24 +571,213 @@ SVSPubSub::cleanUpFetch(const PublicationKey& publication)
   m_fetchingMap.erase(publication);
 }
 
+bool
+SVSPubSub::hasPiggyDeliveredPublication(const PublicationKey& publication)
+{
+  std::lock_guard<std::mutex> lock(m_extraDataMutex);
+  return m_piggyDeliveredPublications.find(publication) != m_piggyDeliveredPublications.end();
+}
+
+void
+SVSPubSub::rememberPiggyDeliveredPublication(const PublicationKey& publication)
+{
+  std::lock_guard<std::mutex> lock(m_extraDataMutex);
+  if (m_piggyDeliveredPublications.find(publication) == m_piggyDeliveredPublications.end()) {
+    m_piggyDeliveredPublicationOrder.push_back(publication);
+  }
+  m_piggyDeliveredPublications[publication] = true;
+  while (m_piggyDeliveredPublications.size() > m_piggyDeliveredPublicationLimit &&
+         !m_piggyDeliveredPublicationOrder.empty()) {
+    m_piggyDeliveredPublications.erase(m_piggyDeliveredPublicationOrder.front());
+    m_piggyDeliveredPublicationOrder.pop_front();
+  }
+}
+
+bool
+SVSPubSub::satisfyPendingFetchFromPiggyData(const Data& data)
+{
+  std::vector<std::pair<PublicationKey, std::vector<Subscription>>> ready;
+
+  for (const auto& entry : m_fetchMap)
+  {
+    const auto& publication = entry.first;
+    try {
+      auto mapping = m_mappingProvider.getMapping(std::get<0>(publication),
+                                                  std::get<1>(publication),
+                                                  std::get<2>(publication));
+      if (mapping.first == data.getName()) {
+        ready.push_back(entry);
+      }
+    }
+    catch (const std::exception&) {
+    }
+  }
+
+  for (const auto& [publication, subscriptions] : ready)
+  {
+    std::optional<Data> packet(data);
+    SubscriptionData subData = {
+      data.getName(),
+      data.getContent().value_bytes(),
+      std::get<0>(publication),
+      std::get<2>(publication),
+      packet,
+    };
+
+    for (const auto& sub : subscriptions) {
+      sub.callback(subData);
+    }
+    rememberPiggyDeliveredPublication(publication);
+    cleanUpFetch(publication);
+  }
+
+  NDN_LOG_TRACE("event=piggyback_satisfy data=" << data.getName()
+                << " matches=" << ready.size());
+
+  return !ready.empty();
+}
+
 Block
 SVSPubSub::onGetExtraData(const VersionVector&)
 {
-  MappingList copy = m_notificationMappingList;
+  std::lock_guard<std::mutex> lock(m_extraDataMutex);
+
+  MappingList includedMappings(m_notificationMappingList.nodeId,
+                               m_opts.syncProtocol.version);
+  size_t mappingCount = 0;
+  size_t piggyCount = 0;
+  if (m_notificationMappingList.nodeId != EMPTY_NAME) {
+    for (const auto& entry : m_notificationMappingList.pairs) {
+      MappingList candidate = includedMappings;
+      candidate.pairs.push_back(entry);
+      auto candidateBlock = candidate.encode();
+      if (candidateBlock.size() <= m_maxApplicationParametersSize) {
+        includedMappings = std::move(candidate);
+        ++mappingCount;
+      }
+    }
+  }
+
+  ndn::Block block = includedMappings.encode();
+  block.parse();
+  size_t size = block.size();
+  size_t retainedCount = 0;
+  size_t expiredCount = 0;
+  std::deque<PiggyDataEntry> retained;
+  for (auto it = m_piggyDataQueue.rbegin(); it != m_piggyDataQueue.rend(); ++it) {
+    auto dataBlock = it->data.wireEncode();
+    if (size + dataBlock.size() > m_maxApplicationParametersSize) {
+      ++it->missed;
+      if (it->missed < 3) {
+        retained.push_front(*it);
+        ++retainedCount;
+      }
+      else {
+        ++expiredCount;
+        NDN_LOG_TRACE("event=piggyback_drop reason=missed_too_many bytes="
+                      << dataBlock.size() << " data=" << it->data.getName());
+      }
+      continue;
+    }
+
+    block.push_back(dataBlock);
+    size += dataBlock.size();
+    ++piggyCount;
+  }
+  m_piggyDataQueue = std::move(retained);
+  block.encode();
+
+  NDN_LOG_TRACE("event=piggyback_build mappings=" << mappingCount
+                << " data=" << piggyCount
+                << " retained=" << retainedCount
+                << " expired=" << expiredCount
+                << " bytes=" << block.size()
+                << " appParamLimit=" << m_maxApplicationParametersSize
+                << " piggyDataLimit=" << m_maxPiggyDataSize);
+
   m_notificationMappingList = MappingList(m_opts.syncProtocol.version);
-  return copy.encode();
+
+  return block;
 }
 
 void
 SVSPubSub::onRecvExtraData(const Block& block, const VersionVector&)
 {
+  std::vector<PublicationKey> receivedMappings;
+  size_t mappingCount = 0;
+  size_t dataCount = 0;
+
   try {
+    NDN_LOG_TRACE("event=piggyback_recv_block type=" << block.type()
+                  << " bytes=" << block.size());
     MappingList list(block, m_opts.syncProtocol.version);
     for (const auto& entry : list.pairs) {
       m_mappingProvider.insertMapping(list.nodeId, entry.bootstrapTime,
                                       entry.seqNo, entry.mapping);
+      receivedMappings.emplace_back(list.nodeId, entry.bootstrapTime, entry.seqNo);
     }
+    mappingCount = list.pairs.size();
+    NDN_LOG_TRACE("event=piggyback_recv_mapping_list node=" << list.nodeId
+                  << " mappings=" << list.pairs.size());
+  }
+  catch (const std::exception& e) {
+    NDN_LOG_TRACE("event=piggyback_recv_mapping_list_error error=" << e.what());
+    return;
+  }
+
+  try {
+    block.parse();
+    for (const auto& childBlock : block.elements()) {
+      NDN_LOG_TRACE("event=piggyback_recv_child type=" << childBlock.type()
+                    << " bytes=" << childBlock.size());
+      if (childBlock.type() == ndn::tlv::Data) {
+        ndn::Data data(childBlock);
+        satisfyPendingFetchFromPiggyData(data);
+        try {
+          std::lock_guard<std::mutex> lock(m_extraDataMutex);
+          const auto dataName = data.getName();
+          if (m_piggyDataCache.find(dataName) == m_piggyDataCache.end()) {
+            m_piggyDataCacheOrder.push_back(dataName);
+          }
+          m_piggyDataCache[dataName] = data;
+          const auto fullName = data.getFullName();
+          if (m_piggyDataCache.find(fullName) == m_piggyDataCache.end()) {
+            m_piggyDataCacheOrder.push_back(fullName);
+          }
+          m_piggyDataCache[fullName] = data;
+          while (m_piggyDataCache.size() > m_piggyDataCacheLimit &&
+                 !m_piggyDataCacheOrder.empty()) {
+            m_piggyDataCache.erase(m_piggyDataCacheOrder.front());
+            m_piggyDataCacheOrder.pop_front();
+          }
+        }
+        catch (const std::exception&) {
+        }
+        ++dataCount;
+      }
+    }
+    NDN_LOG_TRACE("event=piggyback_recv_children mappings=" << mappingCount
+                  << " data=" << dataCount);
   } catch (const std::exception&) {
+  }
+
+  bool queued = false;
+  size_t processed = 0;
+  for (const auto& [nodeId, bootstrapTime, seqNo] : receivedMappings) {
+    try {
+      queued |= processMapping(nodeId, bootstrapTime, seqNo);
+      ++processed;
+    }
+    catch (const std::exception&) {
+    }
+  }
+  if (queued) {
+    fetchAll();
+  }
+  if (!receivedMappings.empty()) {
+    NDN_LOG_TRACE("event=piggyback_process_mappings processed=" << processed
+                  << " received=" << receivedMappings.size()
+                  << " queued=" << queued);
   }
 }
 
