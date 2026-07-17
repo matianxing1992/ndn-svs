@@ -25,7 +25,7 @@ BaseSigner::~BaseSigner() = default;
 void
 KeyChainSigner::sign(Interest& interest) const
 {
-  m_keyChain.sign(interest, signingInfo);
+  m_interestSigner.makeSignedInterest(interest, signingInfo);
 }
 
 void
