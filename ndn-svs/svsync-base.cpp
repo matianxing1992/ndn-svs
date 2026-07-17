@@ -66,7 +66,25 @@ SVSyncBase::publishData(const Block& content,
   NodeID pubId = id != EMPTY_NODE_ID ? id : m_id;
   SeqNo newSeq = m_core.getSeqNo(pubId) + 1;
 
-  Name dataName = getDataName(pubId, newSeq);
+  publishDataAtSeq(content, freshness, pubId, newSeq, contentType);
+  return newSeq;
+}
+
+void
+SVSyncBase::publishDataAtSeq(const Block& content, const ndn::time::milliseconds& freshness,
+                             const NodeID& nid, const SeqNo seq, uint32_t contentType)
+{
+  NodeID pubId = nid != EMPTY_NODE_ID ? nid : m_id;
+  insertDataAtSeq(content, freshness, pubId, seq, contentType);
+  m_core.updateSeqNo(seq, pubId);
+}
+
+void
+SVSyncBase::insertDataAtSeq(const Block& content, const ndn::time::milliseconds& freshness,
+                            const NodeID& nid, const SeqNo seq, uint32_t contentType)
+{
+  NodeID pubId = nid != EMPTY_NODE_ID ? nid : m_id;
+  Name dataName = getDataName(pubId, m_core.getBootstrapTime(), seq);
   auto data = std::make_shared<Data>(dataName);
   data->setContent(content);
   data->setFreshnessPeriod(freshness);
@@ -74,11 +92,11 @@ SVSyncBase::publishData(const Block& content,
 
   m_securityOptions.dataSigner->sign(*data);
 
-  m_dataStore->insert(*data);
-  m_core.updateSeqNo(newSeq, pubId);
+  {
+    std::lock_guard<std::mutex> lock(m_dataStoreMutex);
+    m_dataStore->insert(*data);
+  }
   m_face.put(*data);
-
-  return newSeq;
 }
 
 void
@@ -97,13 +115,39 @@ SVSyncBase::insertDataSegment(const Block& content,
   data->setContentType(contentType);
   data->setFinalBlock(finalBlock);
   m_securityOptions.dataSigner->sign(*data);
-  m_dataStore->insert(*data);
+  {
+    std::lock_guard<std::mutex> lock(m_dataStoreMutex);
+    m_dataStore->insert(*data);
+  }
+}
+
+void
+SVSyncBase::insertPreparedData(const Data& data, bool putToFace)
+{
+  auto preparedData = std::make_shared<Data>(data);
+  {
+    std::lock_guard<std::mutex> lock(m_dataStoreMutex);
+    m_dataStore->insert(*preparedData);
+  }
+  if (putToFace) {
+    m_face.put(*preparedData);
+  }
+}
+
+void
+SVSyncBase::putPreparedData(const Data& data)
+{
+  m_face.put(data);
 }
 
 void
 SVSyncBase::onDataInterest(const Interest& interest)
 {
-  auto data = m_dataStore->find(interest);
+  std::shared_ptr<const Data> data;
+  {
+    std::lock_guard<std::mutex> lock(m_dataStoreMutex);
+    data = m_dataStore->find(interest);
+  }
   if (data != nullptr)
     m_face.put(*data);
 }
@@ -169,8 +213,10 @@ SVSyncBase::fetchData(const NodeID& nid,
 void
 SVSyncBase::onDataValidated(const Data& data, const DataValidatedCallback& dataCallback)
 {
-  if (shouldCache(data))
+  if (shouldCache(data)) {
+    std::lock_guard<std::mutex> lock(m_dataStoreMutex);
     m_dataStore->insert(data);
+  }
 
   dataCallback(data);
 }

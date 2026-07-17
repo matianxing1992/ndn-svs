@@ -21,6 +21,7 @@
 #include "fetcher.hpp"
 
 #include <map>
+#include <mutex>
 
 namespace ndn::svs {
 
@@ -135,6 +136,7 @@ private:
   ndn::ScopedInterestFilterHandle m_interestFilter;
 
   std::map<Name, MappingEntryPair> m_map;
+  std::mutex m_mapMutex;
 };
 
 } // namespace ndn::svs

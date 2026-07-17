@@ -10,11 +10,38 @@
 
 #include "tests/boost-test.hpp"
 
+#include <ndn-cxx/security/signing-helpers.hpp>
 #include <ndn-cxx/util/dummy-client-face.hpp>
+
+#include <boost/asio/io_context.hpp>
+
+#include <thread>
 
 namespace ndn::tests {
 
 using namespace ndn::svs;
+using namespace std::chrono_literals;
+
+BOOST_AUTO_TEST_CASE(ExplicitV2ProfilePropagatesThroughPubSub)
+{
+  DummyClientFace face;
+  SVSPubSubOptions options;
+  options.syncProtocol.version = SvsProtocolVersion::V2;
+  SVSPubSub pubsub("/ndn/test/profile", "/node", face, [] (const auto&) {}, options);
+  BOOST_CHECK(pubsub.getSyncProtocolOptions().version == SvsProtocolVersion::V2);
+  BOOST_CHECK_EQUAL(pubsub.getSyncProtocolOptions().syncInterestLifetime, 1_ms);
+}
+
+static void
+runIoUntil(Face& face, const std::function<bool()>& done)
+{
+  auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (!done() && std::chrono::steady_clock::now() < deadline) {
+    face.getIoContext().restart();
+    face.getIoContext().run_for(10ms);
+    std::this_thread::sleep_for(1ms);
+  }
+}
 
 BOOST_AUTO_TEST_SUITE(TestSVSPubSub)
 
@@ -34,7 +61,8 @@ BOOST_AUTO_TEST_CASE(TypedPiggybackLimitControlsPublicationQueue)
                           [] (const std::vector<MissingDataInfo>&) {}, limitedOpts);
 
   const std::string payload = "piggyback candidate";
-  const auto bytes = make_span(reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
+  const auto bytes = make_span(reinterpret_cast<const uint8_t*>(payload.data()),
+                               payload.size());
   defaultPubsub.publish("/app/default", bytes);
   limitedPubsub.publish("/app/limited", bytes);
 
@@ -56,7 +84,8 @@ BOOST_AUTO_TEST_CASE(LatePiggyDataSatisfiesPendingFetch)
   opts.useTimestamp = false;
 
   SVSPubSub pubsub("/sync", "/local", face,
-                   [] (const std::vector<MissingDataInfo>&) {}, opts);
+                   [] (const std::vector<MissingDataInfo>&) {},
+                   opts);
 
   size_t callbackCount = 0;
   std::string received;
@@ -70,19 +99,19 @@ BOOST_AUTO_TEST_CASE(LatePiggyDataSatisfiesPendingFetch)
     receivedSeq = data.seqNo;
   });
 
-  SeqNo seqNo = 7;
-  BootstrapTime bootstrapTime = 1700000000;
-  pubsub.insertMapping("/peer", bootstrapTime, seqNo, "/app/item", {});
-  BOOST_CHECK(pubsub.processMapping("/peer", bootstrapTime, seqNo));
+  BootstrapTime bootstrapTime = 100;
+  pubsub.insertMapping("/peer", bootstrapTime, 7, "/app/item", {});
+  BOOST_CHECK(pubsub.processMapping("/peer", bootstrapTime, 7));
   BOOST_CHECK_EQUAL(callbackCount, 0);
 
   Data piggyData("/app/item");
   const std::string payload = "piggy";
-  piggyData.setContent(make_span(reinterpret_cast<const uint8_t*>(payload.data()), payload.size()));
+  piggyData.setContent(make_span(reinterpret_cast<const uint8_t*>(payload.data()),
+                                 payload.size()));
   keyChain.sign(piggyData);
 
   MappingList extra("/peer");
-  extra.pairs.push_back({bootstrapTime, seqNo, {Name("/app/item"), {}}});
+  extra.pairs.push_back({bootstrapTime, 7, {Name("/app/item"), {}}});
   Block params = extra.encode();
   params.push_back(piggyData.wireEncode());
   params.encode();
@@ -97,6 +126,62 @@ BOOST_AUTO_TEST_CASE(LatePiggyDataSatisfiesPendingFetch)
 
   pubsub.onRecvExtraData(params, vv);
   BOOST_CHECK_EQUAL(callbackCount, 1);
+}
+
+BOOST_AUTO_TEST_CASE(AsyncPublishQueuesWithoutImmediateFacePut)
+{
+  DummyClientFace face;
+  SVSPubSubOptions opts;
+  opts.useTimestamp = false;
+
+  SVSPubSub pubsub("/sync", "/local", face,
+                   [] (const std::vector<MissingDataInfo>&) {},
+                   opts);
+
+  const std::string payload1 = "one";
+  const std::string payload2 = "two";
+  auto seq1 = pubsub.publishAsync("/app/one",
+                                  make_span(reinterpret_cast<const uint8_t*>(payload1.data()),
+                                            payload1.size()));
+  auto seq2 = pubsub.publishAsync("/app/two",
+                                  make_span(reinterpret_cast<const uint8_t*>(payload2.data()),
+                                            payload2.size()));
+
+  BOOST_CHECK_EQUAL(seq1, 1);
+  BOOST_CHECK_EQUAL(seq2, 2);
+  BOOST_CHECK_EQUAL(face.sentData.size(), 0);
+
+  runIoUntil(face, [&] { return face.sentData.size() >= 2; });
+
+  BOOST_CHECK_EQUAL(pubsub.getSVSync().getCore().getSeqNo("/local"), 2);
+  BOOST_REQUIRE_GE(face.sentData.size(), 2);
+}
+
+BOOST_AUTO_TEST_CASE(AsyncPublishNameOnlyAndPacketAreQueuedAndCommitted)
+{
+  DummyClientFace face;
+  SVSPubSubOptions opts;
+  opts.useTimestamp = false;
+
+  SVSPubSub pubsub("/sync", "/local", face,
+                   [] (const std::vector<MissingDataInfo>&) {},
+                   opts);
+
+  auto seq1 = pubsub.publishAsync("/app/name-only", Name("/provider"));
+  Data packet("/app/packet");
+  const std::string body = "abc";
+  packet.setContent(make_span(reinterpret_cast<const uint8_t*>(body.data()), body.size()));
+  KeyChain packetKeyChain;
+  packetKeyChain.sign(packet, signingWithSha256());
+  auto seq2 = pubsub.publishPacketAsync(packet, Name("/provider"));
+
+  BOOST_CHECK_EQUAL(seq2, seq1 + 1);
+  BOOST_CHECK_EQUAL(face.sentData.size(), 0);
+
+  runIoUntil(face, [&] {
+    return !face.sentData.empty();
+  });
+  BOOST_CHECK_GE(face.sentInterests.size() + face.sentData.size(), 1);
 }
 
 BOOST_AUTO_TEST_CASE(LatePiggyDataStillSatisfiesPendingFetch)
@@ -114,7 +199,8 @@ BOOST_AUTO_TEST_CASE(LatePiggyDataStillSatisfiesPendingFetch)
   SeqNo receivedSeq = 0;
 
   SVSPubSub pubsub("/sync", "/local", face,
-                   [] (const std::vector<MissingDataInfo>&) {}, opts);
+                   [] (const std::vector<MissingDataInfo>&) {},
+                   opts);
   pubsub.subscribe("/app/item", [&] (const SVSPubSub::SubscriptionData& data) {
     ++callbackCount;
     payload.assign(reinterpret_cast<const char*>(data.data.data()), data.data.size());
@@ -122,14 +208,14 @@ BOOST_AUTO_TEST_CASE(LatePiggyDataStillSatisfiesPendingFetch)
     receivedSeq = data.seqNo;
   });
 
-  SeqNo seqNo = 1;
-  BootstrapTime bootstrapTime = 1700000000;
-  pubsub.insertMapping("/peer", bootstrapTime, seqNo, "/app/item", {});
-  pubsub.processMapping("/peer", bootstrapTime, seqNo);
+  BootstrapTime bootstrapTime = 200;
+  pubsub.insertMapping("/peer", bootstrapTime, 1, "/app/item", {});
+  pubsub.processMapping("/peer", bootstrapTime, 1);
 
   Data piggyData("/app/item");
   const std::string body = "late";
-  piggyData.setContent(make_span(reinterpret_cast<const uint8_t*>(body.data()), body.size()));
+  piggyData.setContent(make_span(reinterpret_cast<const uint8_t*>(body.data()),
+                                body.size()));
   keyChain.sign(piggyData);
 
   MappingList extra("/peer");

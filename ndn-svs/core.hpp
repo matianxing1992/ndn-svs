@@ -107,11 +107,31 @@ public:
     uint64_t syncInterestSerialHandlerMs = 0;
     uint64_t syncInterestParallelTotalMs = 0;
     uint64_t syncInterestMainThreadBlockingMs = 0;
+    uint64_t syncProductionJobsSubmitted = 0;
+    uint64_t syncProductionJobsCompleted = 0;
+    uint64_t syncProductionJobsDropped = 0;
+    uint64_t syncProductionJobsStale = 0;
+    uint64_t syncProductionWorkerQueueDepth = 0;
+    uint64_t syncProductionWorkerProcessingMs = 0;
+    uint64_t syncProductionParallelTotalMs = 0;
+  };
+
+  struct SyncRejectionStats
+  {
+    uint64_t malformedEnvelope = 0;
+    uint64_t signaturePolicy = 0;
+    uint64_t vectorDecode = 0;
   };
 
   void
   setParallelSyncProcessing(bool enabled, size_t workerThreads = 1,
                             size_t maxQueueSize = 1024);
+
+  void
+  setParallelSyncProduction(bool enabled, size_t workerThreads = 1,
+                            size_t maxQueueSize = 1024,
+                            bool signInWorker = false,
+                            bool buildExtraBlockInWorker = false);
 
   /**
    * @brief Experimentally coalesce locally triggered sync interests.
@@ -123,6 +143,18 @@ public:
   void
   setSyncInterestBatching(bool enabled,
                           time::milliseconds window = 5_ms);
+
+  /**
+   * @brief Set the maximum randomized suppression delay for replying to Sync
+   * Interests when this node has newer state.
+   *
+   * This is an implementation timer only; it does not affect the SVS wire
+   * format or protocol semantics. Smaller values are useful for small,
+   * latency-sensitive groups, while larger values reduce duplicate Sync
+   * Interests in large groups.
+   */
+  void
+  setMaxSuppressionTime(time::milliseconds delay);
 
   /**
    * @brief Set the periodic Sync Interest retransmission interval.
@@ -137,6 +169,14 @@ public:
 
   SyncProcessingStats
   getSyncProcessingStats() const;
+
+  SyncRejectionStats
+  getSyncRejectionStats() const noexcept
+  {
+    return {m_malformedEnvelopeRejects.load(std::memory_order_relaxed),
+            m_signaturePolicyRejects.load(std::memory_order_relaxed),
+            m_vectorDecodeRejects.load(std::memory_order_relaxed)};
+  }
 
   /**
    * @brief Reset the sync tree (and restart synchronization again)
@@ -213,10 +253,10 @@ public:
   }
 
   /**
-   * @brief Install a bounded collection producer for extension TLVs.
+   * @brief Install a bounded collection producer for trailing extension TLVs.
    *
-   * In V3, extension blocks are placed inside the signed State Vector Data
-   * content. The singular callback remains available for source compatibility.
+   * This is the V3 extension API. The singular callback remains available for
+   * source compatibility and is adapted to a one-element collection.
    */
   void setGetExtraBlocksCallback(const GetExtraBlocksCallback& callback)
   {
@@ -285,17 +325,18 @@ public:
     std::vector<MissingDataInfo> missingInfo;
   };
 
-  struct MergeComputationResult
-  {
-    VersionVector mergedVector;
-    bool myVectorNew = false;
-    bool otherVectorNew = false;
-    std::vector<MissingDataInfo> missingData;
-  };
+  void
+  sendSyncInterestSerial();
 
-  static MergeComputationResult
-  computeMergeStateVector(const VersionVector& localVector,
-                          const VersionVector& remoteVector);
+  /**
+   * @brief Send a Sync Interest for a local publication.
+   *
+   * Local publications must advertise the newly increased sequence number even
+   * if a recently received remote state vector would otherwise suppress a
+   * normal retransmission timer.
+   */
+  void
+  sendLocalPublicationSyncInterest();
 
   /**
    * @brief Merge state vector into the current
@@ -303,6 +344,18 @@ public:
    * @details Also adds missing data interests to data interest queue.
    */
   MergeResult mergeStateVector(const VersionVector& vvOther);
+
+  struct MergeComputationResult
+  {
+    bool myVectorNew = false;
+    bool otherVectorNew = false;
+    std::vector<MissingDataInfo> missingData;
+    VersionVector mergedVector;
+  };
+
+  static MergeComputationResult
+  computeMergeStateVector(const VersionVector& localVector,
+                          const VersionVector& remoteVector);
 
   /**
    * @brief Record vector by merging it into m_recordedVv
@@ -341,10 +394,18 @@ private:
 
   struct SyncProcessingJob;
   struct SyncProcessingResult;
+  struct SyncProductionJob;
+  struct SyncProductionResult;
   class SyncWorkerPool;
 
   void
   processSyncInterestResult(SyncProcessingResult result);
+
+  void
+  processSyncProductionResult(SyncProductionResult result);
+
+  void
+  signSyncInterest(Interest& interest);
 
   void
   schedulePublicationSync();
@@ -397,8 +458,6 @@ private:
 
   // Security
   ndn::KeyChain m_keyChainMem;
-  std::shared_ptr<ValidationGate> m_validationGate = std::make_shared<ValidationGate>();
-  std::atomic<ValidationStatus> m_lastValidationStatus{ValidationStatus::Never};
 
   ndn::Scheduler m_scheduler;
   mutable std::mutex m_schedulerMutex;
@@ -416,6 +475,11 @@ private:
   time::milliseconds m_syncInterestBatchWindow = 5_ms;
 
   std::atomic<bool> m_parallelSyncProcessing{false};
+  std::shared_ptr<ValidationGate> m_validationGate = std::make_shared<ValidationGate>();
+  std::atomic<ValidationStatus> m_lastValidationStatus{ValidationStatus::Never};
+  std::atomic<uint64_t> m_malformedEnvelopeRejects{0};
+  std::atomic<uint64_t> m_signaturePolicyRejects{0};
+  std::atomic<uint64_t> m_vectorDecodeRejects{0};
   std::shared_ptr<std::atomic<bool>> m_syncProcessingAlive;
   std::unique_ptr<SyncWorkerPool> m_syncWorkerPool;
   std::atomic<uint64_t> m_syncJobsSubmitted{0};
@@ -428,6 +492,20 @@ private:
   std::atomic<uint64_t> m_syncInterestSerialHandlerMs{0};
   std::atomic<uint64_t> m_syncInterestParallelTotalMs{0};
   std::atomic<uint64_t> m_syncInterestMainThreadBlockingMs{0};
+
+  std::atomic<bool> m_parallelSyncProduction{false};
+  std::atomic<bool> m_parallelSyncProductionSigning{false};
+  std::atomic<bool> m_parallelSyncProductionExtraBlock{false};
+  std::shared_ptr<std::atomic<bool>> m_syncProductionAlive;
+  std::unique_ptr<SyncWorkerPool> m_syncProductionWorkerPool;
+  std::mutex m_syncProductionSigningMutex;
+  std::atomic<uint64_t> m_syncProductionJobsSubmitted{0};
+  std::atomic<uint64_t> m_syncProductionJobsCompleted{0};
+  std::atomic<uint64_t> m_syncProductionJobsDropped{0};
+  std::atomic<uint64_t> m_syncProductionJobsStale{0};
+  std::atomic<uint64_t> m_syncProductionWorkerQueueDepth{0};
+  std::atomic<uint64_t> m_syncProductionWorkerProcessingMs{0};
+  std::atomic<uint64_t> m_syncProductionParallelTotalMs{0};
 };
 
 } // namespace ndn::svs

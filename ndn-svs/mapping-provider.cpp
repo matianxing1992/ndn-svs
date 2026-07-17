@@ -155,6 +155,7 @@ void
 MappingProvider::insertMapping(const NodeID& nodeId, BootstrapTime bootstrapTime,
                                const SeqNo& seqNo, const MappingEntryPair& entry)
 {
+  std::lock_guard<std::mutex> lock(m_mapMutex);
   m_map[makeMappingKey(nodeId, bootstrapTime, seqNo)] = entry;
 }
 
@@ -162,6 +163,7 @@ MappingEntryPair
 MappingProvider::getMapping(const NodeID& nodeId, BootstrapTime bootstrapTime,
                             const SeqNo& seqNo)
 {
+  std::lock_guard<std::mutex> lock(m_mapMutex);
   return m_map.at(makeMappingKey(nodeId, bootstrapTime, seqNo));
 }
 
