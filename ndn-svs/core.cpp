@@ -22,8 +22,11 @@
 #include <ndn-cxx/security/signing-helpers.hpp>
 #include <ndn-cxx/security/verification-helpers.hpp>
 #include <ndn-cxx/util/logger.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/post.hpp>
 
 #include <chrono>
+#include <cmath>
 
 #ifdef NDN_SVS_COMPRESSION
 #include <boost/iostreams/copy.hpp>
@@ -34,9 +37,29 @@
 
 namespace ndn::svs {
 
-NDN_LOG_INIT(ndn_svs.Core);
+NDN_LOG_INIT(ndn_svs.SyncTimeline);
 
 namespace {
+
+using SteadyClock = std::chrono::steady_clock;
+
+static uint64_t
+elapsedMs(const SteadyClock::time_point& start, const SteadyClock::time_point& end)
+{
+  return std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+}
+
+static uint64_t
+elapsedUs(const SteadyClock::time_point& start, const SteadyClock::time_point& end)
+{
+  return std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+}
+
+static std::string
+syncTraceKey(const Interest& interest)
+{
+  return interest.getName().toUri();
+}
 
 BootstrapTime
 getCurrentBootstrapTime()
@@ -46,6 +69,113 @@ getCurrentBootstrapTime()
 }
 
 } // namespace
+
+struct SVSyncCore::SyncProcessingJob
+{
+  Interest interest;
+  VersionVector localVector;
+  uint64_t stateGeneration = 0;
+  uint64_t incomingFace = 0;
+  SteadyClock::time_point receivedAt;
+  SteadyClock::time_point validatedAt;
+  std::string traceKey;
+};
+
+struct SVSyncCore::SyncProcessingResult
+{
+  SyncProcessingJob job;
+  bool ok = false;
+  bool decodeFailed = false;
+  VersionVector remoteVector;
+  std::vector<Block> extensions;
+  MergeComputationResult merge;
+  bool myVectorNew = false;
+  std::vector<MissingDataInfo> missingData;
+  uint64_t parseUs = 0;
+  uint64_t decodeUs = 0;
+  uint64_t compareUs = 0;
+  uint64_t missingUs = 0;
+  uint64_t workerUs = 0;
+};
+
+class SVSyncCore::SyncWorkerPool
+{
+public:
+  explicit
+  SyncWorkerPool(size_t workerThreads, size_t maxQueueSize)
+    : m_maxQueueSize(std::max<size_t>(1, maxQueueSize))
+  {
+    workerThreads = std::max<size_t>(1, workerThreads);
+    m_workers.reserve(workerThreads);
+    for (size_t i = 0; i < workerThreads; ++i) {
+      m_workers.emplace_back([this] { run(); });
+    }
+  }
+
+  ~SyncWorkerPool()
+  {
+    shutdown();
+  }
+
+  bool
+  post(std::function<void()> job, size_t& queueDepth)
+  {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_stopped || m_queue.size() >= m_maxQueueSize) {
+      queueDepth = m_queue.size();
+      return false;
+    }
+    m_queue.push(std::move(job));
+    queueDepth = m_queue.size();
+    m_cv.notify_one();
+    return true;
+  }
+
+  void
+  shutdown()
+  {
+    {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      if (m_stopped) {
+        return;
+      }
+      m_stopped = true;
+    }
+    m_cv.notify_all();
+    for (auto& worker : m_workers) {
+      if (worker.joinable()) {
+        worker.join();
+      }
+    }
+  }
+
+private:
+  void
+  run()
+  {
+    while (true) {
+      std::function<void()> job;
+      {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_cv.wait(lock, [this] { return m_stopped || !m_queue.empty(); });
+        if (m_stopped && m_queue.empty()) {
+          return;
+        }
+        job = std::move(m_queue.front());
+        m_queue.pop();
+      }
+      job();
+    }
+  }
+
+private:
+  size_t m_maxQueueSize;
+  std::vector<std::thread> m_workers;
+  std::queue<std::function<void()>> m_queue;
+  std::mutex m_mutex;
+  std::condition_variable m_cv;
+  bool m_stopped = false;
+};
 
 SVSyncCore::SVSyncCore(ndn::Face& face,
                        const Name& syncPrefix,
@@ -89,8 +219,94 @@ SVSyncCore::SVSyncCore(ndn::Face& face,
 
 SVSyncCore::~SVSyncCore()
 {
-  std::lock_guard<std::mutex> lock(m_validationGate->mutex);
-  m_validationGate->owner = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(m_validationGate->mutex);
+    m_validationGate->owner = nullptr;
+  }
+  setParallelSyncProcessing(false);
+}
+
+void
+SVSyncCore::setParallelSyncProcessing(bool enabled, size_t workerThreads,
+                                      size_t maxQueueSize)
+{
+  if (!enabled) {
+    m_parallelSyncProcessing = false;
+    if (m_syncProcessingAlive) {
+      m_syncProcessingAlive->store(false, std::memory_order_relaxed);
+    }
+    if (m_syncWorkerPool) {
+      m_syncWorkerPool->shutdown();
+      m_syncWorkerPool.reset();
+    }
+    return;
+  }
+
+  m_syncProcessingAlive = std::make_shared<std::atomic<bool>>(true);
+  if (!m_syncWorkerPool) {
+    m_syncWorkerPool = std::make_unique<SyncWorkerPool>(workerThreads, maxQueueSize);
+  }
+  m_parallelSyncProcessing = true;
+}
+
+void
+SVSyncCore::setSyncInterestBatching(bool enabled, time::milliseconds window)
+{
+  std::lock_guard<std::mutex> lock(m_schedulerMutex);
+  m_syncInterestBatching.store(enabled, std::memory_order_relaxed);
+  m_syncInterestBatchWindow = window;
+  if (!enabled) {
+    m_publicationSyncPending = false;
+    m_publicationSyncEvent.cancel();
+  }
+}
+
+void
+SVSyncCore::setPeriodicSyncTime(time::milliseconds interval, double jitter)
+{
+  if (interval < 1_ms) {
+    interval = 1_ms;
+  }
+  if (jitter < 0.0) {
+    jitter = 0.0;
+  }
+  if (jitter > 1.0) {
+    jitter = 1.0;
+  }
+
+  std::lock_guard<std::mutex> lock(m_schedulerMutex);
+  m_periodicSyncTime = interval;
+  m_periodicSyncJitter = jitter;
+  const auto lower = static_cast<int>(
+    std::max<int64_t>(1, static_cast<int64_t>(
+      std::llround(m_periodicSyncTime.count() * (1.0 - m_periodicSyncJitter)))));
+  const auto upper = static_cast<int>(
+    std::max<int64_t>(lower, static_cast<int64_t>(
+      std::llround(m_periodicSyncTime.count() * (1.0 + m_periodicSyncJitter)))));
+  m_retxDist = std::uniform_int_distribution<>(lower, upper);
+}
+
+SVSyncCore::SyncProcessingStats
+SVSyncCore::getSyncProcessingStats() const
+{
+  SyncProcessingStats stats;
+  stats.syncJobsSubmitted = m_syncJobsSubmitted.load();
+  stats.syncJobsCompleted = m_syncJobsCompleted.load();
+  stats.syncJobsDropped = m_syncJobsDropped.load();
+  stats.syncJobsStale = m_syncJobsStale.load();
+  stats.syncWorkerQueueDepth = m_syncWorkerQueueDepth.load();
+  stats.syncWorkerProcessingMs = m_syncWorkerProcessingMs.load();
+  stats.syncMainThreadPublishMs = m_syncMainThreadPublishMs.load();
+  stats.syncInterestSerialHandlerMs = m_syncInterestSerialHandlerMs.load();
+  stats.syncInterestParallelTotalMs = m_syncInterestParallelTotalMs.load();
+  stats.syncInterestMainThreadBlockingMs = m_syncInterestMainThreadBlockingMs.load();
+  return stats;
+}
+
+void
+SVSyncCore::incrementStat(std::atomic<uint64_t>& counter, uint64_t value) const
+{
+  counter.fetch_add(value, std::memory_order_relaxed);
 }
 
 static inline int
@@ -123,6 +339,11 @@ SVSyncCore::sendInitialInterest()
 void
 SVSyncCore::onSyncInterest(const Interest& interest)
 {
+  auto receivedAt = SteadyClock::now();
+  auto traceKey = syncTraceKey(interest);
+  NDN_LOG_TRACE("event=sync_interest_received key=" << traceKey);
+  NDN_LOG_TRACE("event=validation_start key=" << traceKey);
+
   if (m_protocolOptions.version == SvsProtocolVersion::V3) {
     DecodedSyncEnvelope envelope;
     try {
@@ -170,6 +391,8 @@ SVSyncCore::onSyncInterest(const Interest& interest)
 
   switch (m_securityOptions.interestSigner->signingInfo.getSignerType()) {
     case security::SigningInfo::SIGNER_TYPE_NULL:
+      NDN_LOG_TRACE("event=validation_done key=" << traceKey <<
+                    " validation=none elapsed_us=" << elapsedUs(receivedAt, SteadyClock::now()));
       onSyncInterestValidated(interest);
       return;
 
@@ -177,16 +400,33 @@ SVSyncCore::onSyncInterest(const Interest& interest)
       if (security::verifySignature(interest,
                                     m_keyChainMem.getTpm(),
                                     m_securityOptions.interestSigner->signingInfo.getSignerName(),
-                                    DigestAlgorithm::SHA256))
+                                    DigestAlgorithm::SHA256)) {
+        NDN_LOG_TRACE("event=validation_done key=" << traceKey <<
+                      " validation=hmac elapsed_us=" << elapsedUs(receivedAt, SteadyClock::now()));
         onSyncInterestValidated(interest);
+      }
       return;
 
     default:
-      if (m_securityOptions.validator)
-        m_securityOptions.validator->validate(
-          interest, std::bind(&SVSyncCore::onSyncInterestValidated, this, _1), nullptr);
-      else
+      if (m_securityOptions.validator) {
+        m_securityOptions.validator->validate(interest,
+                                              [this, traceKey, receivedAt] (const Interest& validInterest) {
+                                                NDN_LOG_TRACE("event=validation_done key=" << traceKey <<
+                                                              " validation=validator elapsed_us=" <<
+                                                              elapsedUs(receivedAt, SteadyClock::now()));
+                                                onSyncInterestValidated(validInterest);
+                                              },
+                                              [traceKey, receivedAt] (const Interest&, const auto&) {
+                                                NDN_LOG_DEBUG("event=validation_done key=" << traceKey <<
+                                                              " validation=failed elapsed_us=" <<
+                                                              elapsedUs(receivedAt, SteadyClock::now()));
+                                              });
+      }
+      else {
+        NDN_LOG_TRACE("event=validation_done key=" << traceKey <<
+                      " validation=none elapsed_us=" << elapsedUs(receivedAt, SteadyClock::now()));
         onSyncInterestValidated(interest);
+      }
       return;
   }
 }
@@ -194,31 +434,151 @@ SVSyncCore::onSyncInterest(const Interest& interest)
 void
 SVSyncCore::onSyncInterestValidated(const Interest& interest)
 {
+  if (!m_parallelSyncProcessing || !m_syncWorkerPool) {
+    onSyncInterestValidatedSerial(interest);
+    return;
+  }
+
+  const auto mainStart = SteadyClock::now();
+  const auto traceKey = syncTraceKey(interest);
+  SyncProcessingJob job;
+  job.interest = interest;
+  job.receivedAt = mainStart;
+  job.validatedAt = mainStart;
+  job.traceKey = traceKey;
+
+  NDN_LOG_TRACE("event=sync_interest_parse_start mode=parallel-main key=" << traceKey);
+  {
+    auto tag = interest.getTag<ndn::lp::IncomingFaceIdTag>();
+    if (tag) {
+      job.incomingFace = tag->get();
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lock(m_vvMutex);
+    job.localVector = m_vv;
+    job.stateGeneration = m_stateGeneration;
+  }
+  NDN_LOG_TRACE("event=sync_interest_parse_done mode=parallel-main key=" << traceKey <<
+                " elapsed_us=" << elapsedUs(mainStart, SteadyClock::now()));
+
+  size_t queueDepth = 0;
+  auto* pool = m_syncWorkerPool.get();
+  auto alive = m_syncProcessingAlive;
+  bool queued = pool->post([this, alive, job = std::move(job)] {
+    SyncProcessingResult result;
+    result.job = job;
+    const auto workerStart = SteadyClock::now();
+
+    try {
+      const auto parseStart = SteadyClock::now();
+      auto envelope = SyncProtocolCodec::decode(result.job.interest, m_syncPrefix,
+                                                m_protocolOptions.version);
+      const auto parseDone = SteadyClock::now();
+      result.parseUs = elapsedUs(parseStart, parseDone);
+      NDN_LOG_TRACE("event=sync_interest_parse_done mode=worker key=" << result.job.traceKey <<
+                    " elapsed_us=" << result.parseUs);
+
+      const auto decodeStart = SteadyClock::now();
+      NDN_LOG_TRACE("event=state_vector_decode_start mode=worker key=" << result.job.traceKey);
+      result.remoteVector = std::move(envelope.stateVector);
+      result.extensions = std::move(envelope.extensions);
+      const auto decodeDone = SteadyClock::now();
+      result.decodeUs = elapsedUs(decodeStart, decodeDone);
+      NDN_LOG_TRACE("event=state_vector_decode_done mode=worker key=" << result.job.traceKey <<
+                    " elapsed_us=" << result.decodeUs);
+
+      const auto compareStart = SteadyClock::now();
+      NDN_LOG_TRACE("event=state_compare_start mode=worker key=" << result.job.traceKey);
+      result.merge = computeMergeStateVector(result.job.localVector, result.remoteVector);
+      result.myVectorNew = result.merge.myVectorNew;
+      const auto compareDone = SteadyClock::now();
+      result.compareUs = elapsedUs(compareStart, compareDone);
+      NDN_LOG_TRACE("event=state_compare_done mode=worker key=" << result.job.traceKey <<
+                    " elapsed_us=" << result.compareUs);
+
+      const auto missingStart = SteadyClock::now();
+      NDN_LOG_TRACE("event=missing_data_compute_start mode=worker key=" << result.job.traceKey);
+      result.missingData = result.merge.missingData;
+      const auto missingDone = SteadyClock::now();
+      result.missingUs = elapsedUs(missingStart, missingDone);
+      NDN_LOG_TRACE("event=missing_data_compute_done mode=worker key=" << result.job.traceKey <<
+                    " elapsed_us=" << result.missingUs);
+      result.ok = true;
+    }
+    catch (const std::exception&) {
+      result.decodeFailed = true;
+    }
+
+    const auto workerDone = SteadyClock::now();
+    result.workerUs = elapsedUs(workerStart, workerDone);
+    incrementStat(m_syncWorkerProcessingMs, result.workerUs / 1000);
+    NDN_LOG_TRACE("event=sync_worker_processing_ms key=" << result.job.traceKey <<
+                  " elapsed_ms=" << (result.workerUs / 1000));
+
+    boost::asio::post(m_face.getIoContext(), [this, alive, result = std::move(result)] () mutable {
+      if (!alive || !alive->load(std::memory_order_relaxed)) {
+        return;
+      }
+      processSyncInterestResult(std::move(result));
+    });
+  }, queueDepth);
+
+  m_syncWorkerQueueDepth.store(queueDepth, std::memory_order_relaxed);
+
+  if (!queued) {
+    incrementStat(m_syncJobsDropped);
+    NDN_LOG_DEBUG("event=sync_job_queue_full key=" << traceKey <<
+                  " queue_depth=" << queueDepth << " action=fallback_serial");
+    onSyncInterestValidatedSerial(interest);
+    return;
+  }
+
+  incrementStat(m_syncJobsSubmitted);
+  incrementStat(m_syncInterestMainThreadBlockingMs, elapsedMs(mainStart, SteadyClock::now()));
+}
+
+void
+SVSyncCore::onSyncInterestValidatedSerial(const Interest& interest, bool countSerialStats)
+{
+  const auto handlerStart = SteadyClock::now();
+  const auto traceKey = syncTraceKey(interest);
+
   // Get incoming face (this is needed by NLSR)
   uint64_t incomingFace = 0;
+  const auto parseStart = SteadyClock::now();
+  NDN_LOG_TRACE("event=sync_interest_parse_start mode=serial key=" << traceKey);
   {
     auto tag = interest.getTag<ndn::lp::IncomingFaceIdTag>();
     if (tag) {
       incomingFace = tag->get();
     }
   }
+  NDN_LOG_TRACE("event=sync_interest_parse_done mode=serial key=" << traceKey <<
+                " elapsed_us=" << elapsedUs(parseStart, SteadyClock::now()));
 
-  DecodedSyncEnvelope envelope;
+  VersionVector vvOther;
+  std::vector<Block> extensions;
+  const auto decodeStart = SteadyClock::now();
+  NDN_LOG_TRACE("event=state_vector_decode_start mode=serial key=" << traceKey);
   try {
-    envelope = SyncProtocolCodec::decode(interest, m_syncPrefix, m_protocolOptions.version);
+    auto envelope = SyncProtocolCodec::decode(interest, m_syncPrefix, m_protocolOptions.version);
+    vvOther = std::move(envelope.stateVector);
+    extensions = std::move(envelope.extensions);
   }
-  catch (const std::exception& e) {
-    m_lastValidationStatus.store(ValidationStatus::Rejected, std::memory_order_relaxed);
-    NDN_LOG_DEBUG("Reject invalid SVS Sync Interest: " << e.what());
+  catch (const std::exception&) {
+    NDN_LOG_DEBUG("event=state_vector_decode_failed mode=serial key=" << traceKey);
     return;
   }
+  NDN_LOG_TRACE("event=state_vector_decode_done mode=serial key=" << traceKey <<
+                " elapsed_us=" << elapsedUs(decodeStart, SteadyClock::now()));
 
   // Extension callbacks run only after the complete envelope and state vector
   // have decoded. In V3 these blocks are covered by the embedded Data signature.
   if (m_recvExtraBlock) {
-    for (const auto& extension : envelope.extensions) {
+    for (const auto& extension : extensions) {
       try {
-        m_recvExtraBlock(extension, envelope.stateVector);
+        m_recvExtraBlock(extension, vvOther);
       }
       catch (const std::exception& e) {
         NDN_LOG_DEBUG("Reject SVS extension type=" << extension.type() << ": " << e.what());
@@ -227,7 +587,16 @@ SVSyncCore::onSyncInterestValidated(const Interest& interest)
   }
 
   // Merge state vector
-  auto result = mergeStateVector(envelope.stateVector);
+  const auto compareStart = SteadyClock::now();
+  NDN_LOG_TRACE("event=state_compare_start mode=serial key=" << traceKey);
+  auto result = mergeStateVector(vvOther);
+  NDN_LOG_TRACE("event=state_compare_done mode=serial key=" << traceKey <<
+                " elapsed_us=" << elapsedUs(compareStart, SteadyClock::now()));
+
+  const auto missingStart = SteadyClock::now();
+  NDN_LOG_TRACE("event=missing_data_compute_start mode=serial key=" << traceKey);
+  NDN_LOG_TRACE("event=missing_data_compute_done mode=serial key=" << traceKey <<
+                " elapsed_us=" << elapsedUs(missingStart, SteadyClock::now()));
 
   // Callback if missing data found
   if (!result.missingInfo.empty()) {
@@ -237,7 +606,7 @@ SVSyncCore::onSyncInterestValidated(const Interest& interest)
   }
 
   // Try to record; the call will check if in suppression state
-  if (recordVector(envelope.stateVector))
+  if (recordVector(vvOther))
     return;
 
   // If incoming state identical/newer to local vector, reset timer
@@ -245,7 +614,7 @@ SVSyncCore::onSyncInterestValidated(const Interest& interest)
   if (!result.myVectorNew) {
     retxSyncInterest(false, 0);
   } else {
-    enterSuppressionState(envelope.stateVector);
+    enterSuppressionState(vvOther);
     // Check how much time is left on the timer,
     // reset to ~m_intrReplyDist if more than that.
     int delay = m_intrReplyDist(m_rng);
@@ -258,6 +627,105 @@ SVSyncCore::onSyncInterestValidated(const Interest& interest)
       retxSyncInterest(false, delay);
     }
   }
+
+  const auto totalMs = elapsedMs(handlerStart, SteadyClock::now());
+  NDN_LOG_TRACE("event=total_sync_interest_handler_ms mode=serial key=" << traceKey <<
+                " elapsed_ms=" << totalMs);
+  NDN_LOG_TRACE("event=main_loop_blocked_ms mode=serial key=" << traceKey <<
+                " elapsed_ms=" << totalMs);
+  if (countSerialStats) {
+    incrementStat(m_syncInterestSerialHandlerMs, totalMs);
+    incrementStat(m_syncInterestMainThreadBlockingMs, totalMs);
+  }
+}
+
+void
+SVSyncCore::processSyncInterestResult(SyncProcessingResult result)
+{
+  const auto mainStart = SteadyClock::now();
+  const auto& traceKey = result.job.traceKey;
+
+  if (!result.ok || result.decodeFailed) {
+    NDN_LOG_DEBUG("event=sync_parallel_result_decode_failed key=" << traceKey);
+    return;
+  }
+
+  bool stale = false;
+  uint64_t currentGeneration = 0;
+  {
+    std::lock_guard<std::mutex> lock(m_vvMutex);
+    if (m_stateGeneration != result.job.stateGeneration) {
+      stale = true;
+      currentGeneration = m_stateGeneration;
+    }
+    else {
+      m_vv = result.merge.mergedVector;
+      if (result.merge.otherVectorNew) {
+        ++m_stateGeneration;
+      }
+    }
+  }
+
+  if (stale) {
+    incrementStat(m_syncJobsStale);
+    NDN_LOG_DEBUG("event=sync_job_stale key=" << traceKey <<
+                  " captured_generation=" << result.job.stateGeneration <<
+                  " current_generation=" << currentGeneration <<
+                  " action=fallback_serial");
+    // Keep protocol behavior conservative: recompute against current state on the
+    // Face/io_context thread instead of applying an old worker snapshot.
+    onSyncInterestValidatedSerial(result.job.interest, false);
+    return;
+  }
+
+  if (m_recvExtraBlock) {
+    for (const auto& extension : result.extensions) {
+      try {
+        m_recvExtraBlock(extension, result.remoteVector);
+      }
+      catch (const std::exception& e) {
+        NDN_LOG_DEBUG("Reject SVS extension type=" << extension.type() << ": " << e.what());
+      }
+    }
+  }
+
+  if (!result.missingData.empty())
+  {
+    for (auto& e : result.missingData)
+      e.incomingFace = result.job.incomingFace;
+    m_onUpdate(result.missingData);
+  }
+
+  if (recordVector(result.remoteVector)) {
+    incrementStat(m_syncJobsCompleted);
+    return;
+  }
+
+  if (!result.myVectorNew)
+  {
+    retxSyncInterest(false, 0);
+  }
+  else
+  {
+    enterSuppressionState(result.remoteVector);
+    int delay = m_intrReplyDist(m_rng);
+    delay = suppressionCurve(m_maxSuppressionTime.count(), delay);
+
+    if (getCurrentTime() + delay * 1000 < m_nextSyncInterest)
+    {
+      retxSyncInterest(false, delay);
+    }
+  }
+
+  const auto mainMs = elapsedMs(mainStart, SteadyClock::now());
+  const auto totalMs = elapsedMs(result.job.receivedAt, SteadyClock::now());
+  incrementStat(m_syncJobsCompleted);
+  incrementStat(m_syncInterestMainThreadBlockingMs, mainMs);
+  incrementStat(m_syncInterestParallelTotalMs, totalMs);
+  NDN_LOG_TRACE("event=sync_interest_parallel_total_ms key=" << traceKey <<
+                " elapsed_ms=" << totalMs);
+  NDN_LOG_TRACE("event=main_loop_blocked_ms mode=parallel key=" << traceKey <<
+                " elapsed_ms=" << mainMs);
 }
 
 void
@@ -287,10 +755,31 @@ SVSyncCore::retxSyncInterest(bool send, unsigned int delay)
 }
 
 void
+SVSyncCore::schedulePublicationSync()
+{
+  std::lock_guard<std::mutex> lock(m_schedulerMutex);
+  if (m_publicationSyncPending) {
+    return;
+  }
+
+  m_publicationSyncPending = true;
+  m_publicationSyncEvent = m_scheduler.schedule(m_syncInterestBatchWindow, [this] {
+    {
+      std::lock_guard<std::mutex> lock(m_schedulerMutex);
+      m_publicationSyncPending = false;
+    }
+    retxSyncInterest(true, 0);
+  });
+}
+
+void
 SVSyncCore::sendSyncInterest()
 {
   if (!m_initialized)
     return;
+
+  const auto publishStart = SteadyClock::now();
+  NDN_LOG_TRACE("event=response_encode_start key=" << m_syncPrefix);
 
   VersionVector stateVector;
   std::vector<Block> extensions;
@@ -316,6 +805,11 @@ SVSyncCore::sendSyncInterest()
         m_securityOptions.dataSigner->sign(data);
       }
     });
+  NDN_LOG_TRACE("event=response_encode_done key=" << interest.getName() <<
+                " elapsed_us=" << elapsedUs(publishStart, SteadyClock::now()));
+
+  const auto signStart = SteadyClock::now();
+  NDN_LOG_TRACE("event=response_sign_start key=" << interest.getName());
 
   if (m_protocolOptions.version == SvsProtocolVersion::V2) {
     switch (m_securityOptions.interestSigner->signingInfo.getSignerType()) {
@@ -329,8 +823,16 @@ SVSyncCore::sendSyncInterest()
         break;
     }
   }
+  NDN_LOG_TRACE("event=response_sign_done key=" << interest.getName() <<
+                " elapsed_us=" << elapsedUs(signStart, SteadyClock::now()));
 
+  const auto faceStart = SteadyClock::now();
+  NDN_LOG_TRACE("event=face_put_start key=" << interest.getName() <<
+                " operation=expressInterest");
   m_face.expressInterest(interest, nullptr, nullptr, nullptr);
+  NDN_LOG_TRACE("event=face_put_done key=" << interest.getName() <<
+                " operation=expressInterest elapsed_us=" << elapsedUs(faceStart, SteadyClock::now()));
+  incrementStat(m_syncMainThreadPublishMs, elapsedMs(publishStart, SteadyClock::now()));
 }
 
 SVSyncCore::MergeResult
@@ -339,6 +841,9 @@ SVSyncCore::mergeStateVector(const VersionVector& vvOther)
   std::lock_guard<std::mutex> lock(m_vvMutex);
   auto result = computeMergeStateVector(m_vv, vvOther);
   m_vv = result.mergedVector;
+  if (result.otherVectorNew) {
+    ++m_stateGeneration;
+  }
   return {result.myVectorNew, result.otherVectorNew, result.missingData};
 }
 
@@ -411,10 +916,20 @@ SVSyncCore::updateSeqNo(const SeqNo& seq, BootstrapTime bootstrapTime, const Nod
     std::lock_guard<std::mutex> lock(m_vvMutex);
     prev = m_vv.get(t_nid, bootstrapTime);
     m_vv.set(t_nid, bootstrapTime, seq);
+    if (seq > prev) {
+      ++m_stateGeneration;
+    }
   }
 
   if (seq > prev)
-    retxSyncInterest(false, 1);
+  {
+    if (m_syncInterestBatching.load(std::memory_order_relaxed)) {
+      schedulePublicationSync();
+    }
+    else {
+      retxSyncInterest(false, 1);
+    }
+  }
 }
 
 std::set<NodeID>
