@@ -25,6 +25,7 @@
 
 #include <ndn-cxx/security/validator-null.hpp>
 #include <ndn-cxx/util/regex.hpp>
+#include <ndn-cxx/util/scheduler.hpp>
 
 #include <deque>
 #include <map>
@@ -34,8 +35,6 @@
 #include <chrono>
 #include <optional>
 #include <tuple>
-
-#include <boost/asio/thread_pool.hpp>
 
 namespace ndn::svs {
 
@@ -97,6 +96,12 @@ struct SVSPubSubOptions
    * mappingFetchRetries is non-negative.
    */
   time::milliseconds mappingFetchFailureBackoff = 30_s;
+
+  /** @brief Initial delay before retrying a failed asynchronous commit head. */
+  time::milliseconds asyncCommitRetryInitial = 10_ms;
+
+  /** @brief Maximum delay between asynchronous commit-head retries. */
+  time::milliseconds asyncCommitRetryMax = 1_s;
 };
 
 /**
@@ -171,13 +176,13 @@ public:
                 std::vector<Block> mappingBlocks = {});
 
   /**
-   * @brief Queue a publication and return immediately with a reserved seqNo.
+   * @brief Prepare a publication safely and defer its advertisement.
    *
-   * The existing publish() API remains synchronous. This API copies the input
-   * bytes, reserves a sequence number, and prepares signing, encoding, data-store,
-   * and mapping work on the async publication worker pool. The Face/io_context
-   * thread only commits prepared publications in sequence order and performs the
-   * final Face/update operations.
+   * The existing publish() API remains synchronous. This API completes all
+   * fallible signing, final encoding, and local storage before returning the
+   * reserved sequence number. Mapping installation, optional active Data
+   * emission, and state-vector advertisement are deferred to the Face
+   * io_context and commit in sequence order.
    */
   SeqNo
   publishAsync(const Name& name, span<const uint8_t> value,
@@ -369,7 +374,10 @@ NDN_SVS_PUBLIC_WITH_TESTS_ELSE_PRIVATE:
     std::optional<Data> piggyPacket;
     std::vector<Block> mappingBlocks;
     bool putFirstPacketToFace = false;
+    bool stored = false;
     bool ok = true;
+    size_t commitAttempts = 0;
+    bool retryScheduled = false;
   };
 
   struct PiggyDataEntry
@@ -378,11 +386,8 @@ NDN_SVS_PUBLIC_WITH_TESTS_ELSE_PRIVATE:
     size_t missed = 0;
   };
 
-  void
-  enqueueAsyncPublication(AsyncPublication publication);
-
-  void
-  prepareAsyncPublication(AsyncPublication publication);
+  SeqNo
+  prepareAndStageAsyncPublication(AsyncPublication publication);
 
   void
   onPreparedPublication(PreparedPublication publication);
@@ -391,7 +396,10 @@ NDN_SVS_PUBLIC_WITH_TESTS_ELSE_PRIVATE:
   commitReadyPreparedPublications(const NodeID& nid);
 
   void
-  commitPreparedPublication(const PreparedPublication& publication);
+  commitPreparedPublication(PreparedPublication& publication);
+
+  void
+  schedulePreparedPublicationRetry(const NodeID& nid, SeqNo seqNo);
 
   PreparedPublication
   prepareReservedBytes(const AsyncPublication& publication);
@@ -402,6 +410,40 @@ NDN_SVS_PUBLIC_WITH_TESTS_ELSE_PRIVATE:
   PreparedPublication
   prepareReservedPacket(const AsyncPublication& publication);
 
+  std::vector<Data>
+  prepareSegmentedPackets(const AsyncPublication& publication);
+
+  Data
+  prepareOuterSegment(const AsyncPublication& publication, size_t segmentNo,
+                      const Name::Component& finalBlock, size_t offset,
+                      size_t contentSize);
+
+  static bool
+  isFinalPacketSizeAllowed(size_t wireSize)
+  {
+    return wireSize <= MAX_NDN_PACKET_SIZE;
+  }
+
+  void
+  setPreparedPublicationCommitHookForTest(std::function<void(SeqNo)> hook)
+  {
+    m_preparedPublicationCommitHook = std::move(hook);
+  }
+
+  size_t
+  getPreparedPublicationCountForTest(const NodeID& nid) const
+  {
+    auto it = m_preparedPublications.find(nid);
+    return it == m_preparedPublications.end() ? 0 : it->second.size();
+  }
+
+  size_t
+  getStagedPublicationCountForTest(const NodeID& nid) const
+  {
+    auto it = m_stagedPublicationPackets.find(nid);
+    return it == m_stagedPublicationPackets.end() ? 0 : it->second.size();
+  }
+
 public:
   static inline const Name EMPTY_NAME;
   static constexpr size_t MAX_DATA_SIZE = 8000;
@@ -409,6 +451,7 @@ public:
 
 private:
   Face& m_face;
+  ndn::Scheduler m_scheduler;
   const Name m_syncPrefix;
   const Name m_dataPrefix;
   const UpdateCallback m_onUpdate;
@@ -454,14 +497,15 @@ private:
   std::mutex m_extraDataMutex;
 
   std::mutex m_asyncPublishMutex;
+  std::mutex m_segmentedPublishMutex;
   std::map<NodeID, SeqNo> m_reservedSeqNo;
-  std::deque<AsyncPublication> m_asyncPublishQueue;
   std::map<NodeID, SeqNo> m_nextAsyncCommitSeq;
   std::map<NodeID, std::map<SeqNo, PreparedPublication>> m_preparedPublications;
+  std::map<NodeID, std::map<SeqNo, std::vector<Data>>> m_stagedPublicationPackets;
 
-  boost::asio::thread_pool m_asyncPublishWorkers;
   std::shared_ptr<std::atomic_bool> m_asyncPublishAlive;
   std::mutex m_asyncPublishSigningMutex;
+  std::function<void(SeqNo)> m_preparedPublicationCommitHook;
 };
 
 } // namespace ndn::svs

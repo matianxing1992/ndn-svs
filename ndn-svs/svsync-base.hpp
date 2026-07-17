@@ -149,6 +149,14 @@ public:
   void
   insertPreparedData(const Data& data, bool putToFace = false);
 
+  /** @brief Atomically expose a prepared logical publication to the local store. */
+  void
+  insertPreparedDataBatch(const std::vector<Data>& packets);
+
+  /** @brief Remove prepared packets after a later commit step fails. */
+  bool
+  removePreparedDataBatch(const std::vector<Data>& packets) noexcept;
+
   /**
    * @brief Put an already-prepared Data packet on the Face without touching the
    * store. Used after worker-thread insertion to keep Face operations on the
@@ -156,6 +164,15 @@ public:
    */
   void
   putPreparedData(const Data& data);
+
+NDN_SVS_PUBLIC_WITH_TESTS_ELSE_PRIVATE:
+  void
+  setPreparedDataPutHookForTest(std::function<void(const Data&)> hook)
+  {
+    m_preparedDataPutHook = std::move(hook);
+  }
+
+public:
 
   /**
    * @brief Retrive a data packet with a particular seqNo from a session
@@ -278,7 +295,9 @@ private:
   const UpdateCallback m_onUpdate;
 
   std::shared_ptr<DataStore> m_dataStore;
+  std::function<void(const Data&)> m_preparedDataPutHook;
   std::mutex m_dataStoreMutex;
+  time::milliseconds m_fetchInterestLifetime = 2_s;
   SVSyncCore m_core;
 };
 

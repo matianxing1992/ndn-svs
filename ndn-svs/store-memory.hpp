@@ -36,6 +36,16 @@ public:
     return m_ims.insert(data);
   }
 
+  bool supportsErase() const noexcept override
+  {
+    return true;
+  }
+
+  void erase(const Name& name) override
+  {
+    m_ims.erase(name, false);
+  }
+
 private:
   InMemoryStoragePersistent m_ims;
 };

@@ -38,6 +38,7 @@ SVSPubSub::SVSPubSub(const Name& syncPrefix,
                      const SVSPubSubOptions& options,
                      const SecurityOptions& securityOptions)
   : m_face(face)
+  , m_scheduler(face.getIoContext())
   , m_syncPrefix(syncPrefix)
   , m_dataPrefix(nodePrefix)
   , m_onUpdate(std::move(updateCallback))
@@ -54,7 +55,6 @@ SVSPubSub::SVSPubSub(const Name& syncPrefix,
   , m_maxApplicationParametersSize(std::max<size_t>(1, options.maxApplicationParametersSize))
   , m_maxPiggyDataSize(std::max<size_t>(1, options.maxPiggyDataSize))
   , m_piggyDataCacheLimit(std::max<size_t>(1, options.piggyDataCacheLimit))
-  , m_asyncPublishWorkers(4)
   , m_asyncPublishAlive(std::make_shared<std::atomic_bool>(true))
 {
   m_svsync.getCore().setGetExtraBlockCallback(std::bind(&SVSPubSub::onGetExtraData, this, _1));
@@ -66,8 +66,29 @@ SVSPubSub::~SVSPubSub()
   if (m_asyncPublishAlive) {
     m_asyncPublishAlive->store(false, std::memory_order_relaxed);
   }
-  m_asyncPublishWorkers.stop();
-  m_asyncPublishWorkers.join();
+  std::vector<std::vector<Data>> unadvertised;
+  {
+    std::lock_guard<std::mutex> lock(m_asyncPublishMutex);
+    for (const auto& [node, publications] : m_stagedPublicationPackets) {
+      for (const auto& [seq, packets] : publications) {
+        unadvertised.push_back(packets);
+      }
+    }
+    for (const auto& [node, publications] : m_preparedPublications) {
+      for (const auto& [seq, publication] : publications) {
+        if (publication.stored) {
+          unadvertised.push_back(publication.outerPackets);
+        }
+      }
+    }
+    m_stagedPublicationPackets.clear();
+    m_preparedPublications.clear();
+  }
+  for (const auto& packets : unadvertised) {
+    if (!m_svsync.removePreparedDataBatch(packets)) {
+      NDN_LOG_ERROR("event=async_publish_shutdown_rollback_failed packets=" << packets.size());
+    }
+  }
 }
 
 SeqNo
@@ -77,64 +98,17 @@ SVSPubSub::publish(const Name& name,
                    time::milliseconds freshnessPeriod,
                    std::vector<Block> mappingBlocks)
 {
-  // Segment the data if larger than MAX_DATA_SIZE
-  if (value.size() > MAX_DATA_SIZE) {
-    size_t nSegments = (value.size() / MAX_DATA_SIZE) + 1;
-    auto finalBlock = name::Component::fromSegment(nSegments - 1);
-
-    NodeID nid = nodePrefix == EMPTY_NAME ? m_dataPrefix : nodePrefix;
-    SeqNo seqNo = reserveSeqNo(nid);
-    BootstrapTime bootstrapTime = m_svsync.getCore().getBootstrapTime();
-
-    for (size_t i = 0; i < nSegments; i++) {
-      // Create encapsulated segment
-      auto segmentName = Name(name).appendVersion(0).appendSegment(i);
-      auto segment = Data(segmentName);
-      segment.setFreshnessPeriod(freshnessPeriod);
-
-      const uint8_t* segVal = value.data() + i * MAX_DATA_SIZE;
-      const size_t segValSize = std::min(value.size() - i * MAX_DATA_SIZE, MAX_DATA_SIZE);
-      segment.setContent(ndn::make_span(segVal, segValSize));
-
-      segment.setFinalBlock(finalBlock);
-      m_securityOptions.dataSigner->sign(segment);
-
-      // Insert outer segment
-      m_svsync.insertDataSegment(
-        segment.wireEncode(), freshnessPeriod, nid, seqNo, i, finalBlock, ndn::tlv::Data);
-    }
-
-    // Insert mapping and manually update the sequence number
-    insertMapping(nid, bootstrapTime, seqNo, name, mappingBlocks);
-    m_svsync.getCore().updateSeqNo(seqNo, nid);
-    return seqNo;
-  } else {
-    ndn::Data data(name);
-    data.setContent(value);
-    data.setFreshnessPeriod(freshnessPeriod);
-    m_securityOptions.dataSigner->sign(data);
-    // If the data is within the configured limit, add it to the piggyback queue.
-    const auto wireSize = data.wireEncode().size();
-    if (wireSize <= m_maxPiggyDataSize) {
-      std::lock_guard<std::mutex> lock(m_extraDataMutex);
-      m_piggyDataQueue.push_back({data, 0});
-    }
-    else {
-      NDN_LOG_TRACE("event=piggyback_skip reason=data_too_large bytes=" << wireSize
-                    << " limit=" << m_maxPiggyDataSize
-                    << " data=" << data.getName());
-    }
-    return publishPacket(data, nodePrefix);
-  }
-}
-
-SeqNo
-SVSPubSub::publishAsync(const Name& name, span<const uint8_t> value,
-                        const Name& nodePrefix, time::milliseconds freshnessPeriod,
-                        std::vector<Block> mappingBlocks)
-{
+  // A segmented publication is one logical transaction. Serialize its
+  // tentative sequence, complete every fallible sign/encode/store operation,
+  // and only then expose the sequence to SVS or later callers.
+  std::lock_guard<std::mutex> orderLock(m_segmentedPublishMutex);
   NodeID nid = nodePrefix == EMPTY_NAME ? m_dataPrefix : nodePrefix;
-  SeqNo seqNo = reserveSeqNo(nid);
+  SeqNo seqNo;
+  {
+    std::lock_guard<std::mutex> lock(m_asyncPublishMutex);
+    auto reserved = m_reservedSeqNo[nid];
+    seqNo = std::max(reserved, m_svsync.getCore().getSeqNo(nid)) + 1;
+  }
 
   AsyncPublication publication;
   publication.kind = AsyncPublication::Kind::Bytes;
@@ -145,9 +119,32 @@ SVSPubSub::publishAsync(const Name& name, span<const uint8_t> value,
   publication.freshnessPeriod = freshnessPeriod;
   publication.value.assign(value.begin(), value.end());
   publication.mappingBlocks = std::move(mappingBlocks);
-  enqueueAsyncPublication(std::move(publication));
 
+  auto prepared = prepareReservedBytes(publication);
+  commitPreparedPublication(prepared);
+  m_svsync.getCore().updateSeqNo(seqNo, nid);
+  {
+    std::lock_guard<std::mutex> lock(m_asyncPublishMutex);
+    m_reservedSeqNo[nid] = seqNo;
+    m_nextAsyncCommitSeq[nid] = seqNo + 1;
+  }
   return seqNo;
+}
+
+SeqNo
+SVSPubSub::publishAsync(const Name& name, span<const uint8_t> value,
+                        const Name& nodePrefix, time::milliseconds freshnessPeriod,
+                        std::vector<Block> mappingBlocks)
+{
+  std::lock_guard<std::mutex> orderLock(m_segmentedPublishMutex);
+  AsyncPublication publication;
+  publication.kind = AsyncPublication::Kind::Bytes;
+  publication.name = name;
+  publication.nodePrefix = nodePrefix == EMPTY_NAME ? m_dataPrefix : nodePrefix;
+  publication.freshnessPeriod = freshnessPeriod;
+  publication.value.assign(value.begin(), value.end());
+  publication.mappingBlocks = std::move(mappingBlocks);
+  return prepareAndStageAsyncPublication(std::move(publication));
 }
 
 
@@ -173,20 +170,15 @@ SVSPubSub::publishAsync(const Name& name,
                         const Name& nodePrefix, time::milliseconds freshnessPeriod,
                         std::vector<Block> mappingBlocks)
 {
-  NodeID nid = nodePrefix == EMPTY_NAME ? m_dataPrefix : nodePrefix;
-  SeqNo seqNo = reserveSeqNo(nid);
+  std::lock_guard<std::mutex> orderLock(m_segmentedPublishMutex);
 
   AsyncPublication publication;
   publication.kind = AsyncPublication::Kind::NameOnly;
-  publication.bootstrapTime = m_svsync.getCore().getBootstrapTime();
-  publication.seqNo = seqNo;
   publication.name = name;
-  publication.nodePrefix = nid;
+  publication.nodePrefix = nodePrefix == EMPTY_NAME ? m_dataPrefix : nodePrefix;
   publication.freshnessPeriod = freshnessPeriod;
   publication.mappingBlocks = std::move(mappingBlocks);
-  enqueueAsyncPublication(std::move(publication));
-
-  return seqNo;
+  return prepareAndStageAsyncPublication(std::move(publication));
 }
 
 SeqNo
@@ -207,21 +199,16 @@ SeqNo
 SVSPubSub::publishPacketAsync(const Data& data, const Name& nodePrefix,
                               std::vector<Block> mappingBlocks)
 {
-  NodeID nid = nodePrefix == EMPTY_NAME ? m_dataPrefix : nodePrefix;
-  SeqNo seqNo = reserveSeqNo(nid);
+  std::lock_guard<std::mutex> orderLock(m_segmentedPublishMutex);
 
   AsyncPublication publication;
   publication.kind = AsyncPublication::Kind::Packet;
-  publication.bootstrapTime = m_svsync.getCore().getBootstrapTime();
-  publication.seqNo = seqNo;
   publication.name = data.getName();
-  publication.nodePrefix = nid;
+  publication.nodePrefix = nodePrefix == EMPTY_NAME ? m_dataPrefix : nodePrefix;
   publication.freshnessPeriod = data.getFreshnessPeriod();
   publication.packet = data;
   publication.mappingBlocks = std::move(mappingBlocks);
-  enqueueAsyncPublication(std::move(publication));
-
-  return seqNo;
+  return prepareAndStageAsyncPublication(std::move(publication));
 }
 
 SeqNo
@@ -237,51 +224,54 @@ SVSPubSub::reserveSeqNo(const NodeID& nid)
   return seqNo;
 }
 
-void
-SVSPubSub::enqueueAsyncPublication(AsyncPublication publication)
+SeqNo
+SVSPubSub::prepareAndStageAsyncPublication(AsyncPublication publication)
 {
+  const auto nid = publication.nodePrefix;
+  std::unique_lock<std::mutex> reservationLock(m_asyncPublishMutex);
+  SeqNo& reserved = m_reservedSeqNo[nid];
+  reserved = std::max(reserved, m_svsync.getCore().getSeqNo(nid));
+  publication.seqNo = reserved + 1;
+  publication.bootstrapTime = m_svsync.getCore().getBootstrapTime();
+
+  PreparedPublication prepared;
+  switch (publication.kind) {
+    case AsyncPublication::Kind::Bytes:
+      prepared = prepareReservedBytes(publication);
+      break;
+    case AsyncPublication::Kind::NameOnly:
+      prepared = prepareReservedNameOnly(publication);
+      break;
+    case AsyncPublication::Kind::Packet:
+      prepared = prepareReservedPacket(publication);
+      break;
+  }
+  if (!prepared.outerPackets.empty()) {
+    m_svsync.insertPreparedDataBatch(prepared.outerPackets);
+    prepared.stored = true;
+  }
+
+  reserved = publication.seqNo;
+  if (m_nextAsyncCommitSeq.find(nid) == m_nextAsyncCommitSeq.end()) {
+    m_nextAsyncCommitSeq[nid] = publication.seqNo;
+  }
+  m_stagedPublicationPackets[nid][publication.seqNo] = prepared.outerPackets;
+  reservationLock.unlock();
+
   auto alive = m_asyncPublishAlive;
-  boost::asio::post(m_asyncPublishWorkers,
-                    [this, alive, publication = std::move(publication)] () mutable {
+  boost::asio::post(m_face.getIoContext(),
+                    [this, alive, prepared = std::move(prepared)] () mutable {
                       if (!alive || !alive->load(std::memory_order_relaxed)) {
                         return;
                       }
-                      prepareAsyncPublication(std::move(publication));
+                      try {
+                        onPreparedPublication(std::move(prepared));
+                      }
+                      catch (const std::exception& e) {
+                        NDN_LOG_ERROR("event=async_publish_callback_failed error=" << e.what());
+                      }
                     });
-}
-
-void
-SVSPubSub::prepareAsyncPublication(AsyncPublication publication)
-{
-  PreparedPublication prepared;
-  try {
-    switch (publication.kind) {
-      case AsyncPublication::Kind::Bytes:
-        prepared = prepareReservedBytes(publication);
-        break;
-      case AsyncPublication::Kind::NameOnly:
-        prepared = prepareReservedNameOnly(publication);
-        break;
-      case AsyncPublication::Kind::Packet:
-        prepared = prepareReservedPacket(publication);
-        break;
-    }
-  }
-  catch (const std::exception& e) {
-    NDN_LOG_DEBUG("event=async_publish_prepare_failed node=" << publication.nodePrefix
-                  << " seq=" << publication.seqNo << " error=" << e.what());
-    prepared.seqNo = publication.seqNo;
-    prepared.nodePrefix = publication.nodePrefix;
-    prepared.ok = false;
-  }
-
-  auto alive = m_asyncPublishAlive;
-  boost::asio::post(m_face.getIoContext(), [this, alive, prepared = std::move(prepared)] () mutable {
-    if (!alive || !alive->load(std::memory_order_relaxed)) {
-      return;
-    }
-    onPreparedPublication(std::move(prepared));
-  });
+  return publication.seqNo;
 }
 
 SVSPubSub::PreparedPublication
@@ -295,48 +285,6 @@ SVSPubSub::prepareReservedBytes(const AsyncPublication& publication)
   prepared.freshnessPeriod = publication.freshnessPeriod;
   prepared.mappingBlocks = publication.mappingBlocks;
 
-  if (publication.value.size() > MAX_DATA_SIZE) {
-    size_t nSegments = (publication.value.size() / MAX_DATA_SIZE) + 1;
-    auto finalBlock = name::Component::fromSegment(nSegments - 1);
-
-    for (size_t i = 0; i < nSegments; i++)
-    {
-      auto segmentName = Name(publication.name).appendVersion(0).appendSegment(i);
-      auto segment = Data(segmentName);
-      segment.setFreshnessPeriod(publication.freshnessPeriod);
-
-      const uint8_t* segVal = publication.value.data() + i * MAX_DATA_SIZE;
-      const size_t segValSize = std::min(publication.value.size() - i * MAX_DATA_SIZE,
-                                         MAX_DATA_SIZE);
-      segment.setContent(ndn::make_span(segVal, segValSize));
-
-      segment.setFinalBlock(finalBlock);
-      {
-        std::lock_guard<std::mutex> lock(m_asyncPublishSigningMutex);
-        m_securityOptions.dataSigner->sign(segment);
-      }
-
-      Data outer(m_svsync.getDataName(publication.nodePrefix, publication.bootstrapTime,
-                                      publication.seqNo)
-                   .appendVersion(0).appendSegment(i));
-      outer.setContent(segment.wireEncode());
-      outer.setFreshnessPeriod(publication.freshnessPeriod);
-      outer.setContentType(ndn::tlv::Data);
-      outer.setFinalBlock(finalBlock);
-      {
-        std::lock_guard<std::mutex> lock(m_asyncPublishSigningMutex);
-        m_securityOptions.dataSigner->sign(outer);
-      }
-      outer.wireEncode();
-      m_svsync.insertPreparedData(outer, false);
-      prepared.outerPackets.push_back(std::move(outer));
-    }
-
-    insertMapping(publication.nodePrefix, publication.bootstrapTime, publication.seqNo,
-                  publication.name, publication.mappingBlocks);
-    return prepared;
-  }
-
   ndn::Data data(publication.name);
   data.setContent(make_span(publication.value.data(), publication.value.size()));
   data.setFreshnessPeriod(publication.freshnessPeriod);
@@ -344,28 +292,123 @@ SVSPubSub::prepareReservedBytes(const AsyncPublication& publication)
     std::lock_guard<std::mutex> lock(m_asyncPublishSigningMutex);
     m_securityOptions.dataSigner->sign(data);
   }
-  const auto wireSize = data.wireEncode().size();
-  if (wireSize <= m_maxPiggyDataSize) {
+  const auto innerWireSize = data.wireEncode().size();
+  if (innerWireSize <= m_maxPiggyDataSize) {
     prepared.piggyPacket = data;
   }
   else {
-    NDN_LOG_TRACE("event=piggyback_skip reason=data_too_large bytes=" << wireSize
+    NDN_LOG_TRACE("event=piggyback_skip reason=data_too_large bytes=" << innerWireSize
                   << " limit=" << m_maxPiggyDataSize
                   << " data=" << data.getName());
   }
 
-  AsyncPublication packetPublication;
-  packetPublication.kind = AsyncPublication::Kind::Packet;
-  packetPublication.bootstrapTime = publication.bootstrapTime;
-  packetPublication.seqNo = publication.seqNo;
-  packetPublication.name = data.getName();
-  packetPublication.nodePrefix = publication.nodePrefix;
-  packetPublication.freshnessPeriod = data.getFreshnessPeriod();
-  packetPublication.packet = data;
-  packetPublication.mappingBlocks = publication.mappingBlocks;
-  auto packetPrepared = prepareReservedPacket(packetPublication);
-  packetPrepared.piggyPacket = prepared.piggyPacket;
-  return packetPrepared;
+  Data outer(m_svsync.getDataName(publication.nodePrefix, publication.bootstrapTime,
+                                  publication.seqNo));
+  outer.setContent(data.wireEncode());
+  outer.setFreshnessPeriod(publication.freshnessPeriod);
+  outer.setContentType(ndn::tlv::Data);
+  {
+    std::lock_guard<std::mutex> lock(m_asyncPublishSigningMutex);
+    m_securityOptions.dataSigner->sign(outer);
+  }
+
+  if (isFinalPacketSizeAllowed(outer.wireEncode().size())) {
+    prepared.putFirstPacketToFace = true;
+    prepared.outerPackets.push_back(std::move(outer));
+    return prepared;
+  }
+
+  prepared.piggyPacket.reset();
+  prepared.putFirstPacketToFace = false;
+  prepared.outerPackets = prepareSegmentedPackets(publication);
+  return prepared;
+}
+
+Data
+SVSPubSub::prepareOuterSegment(const AsyncPublication& publication, size_t segmentNo,
+                               const Name::Component& finalBlock, size_t offset,
+                               size_t contentSize)
+{
+  auto innerName = Name(publication.name).appendVersion(0).appendSegment(segmentNo);
+  Data inner(innerName);
+  inner.setFreshnessPeriod(publication.freshnessPeriod);
+  inner.setContent(make_span(publication.value.data() + offset, contentSize));
+  inner.setFinalBlock(finalBlock);
+  {
+    std::lock_guard<std::mutex> lock(m_asyncPublishSigningMutex);
+    m_securityOptions.dataSigner->sign(inner);
+  }
+
+  Data outer(m_svsync.getDataName(publication.nodePrefix, publication.bootstrapTime,
+                                  publication.seqNo)
+               .appendVersion(0).appendSegment(segmentNo));
+  outer.setContent(inner.wireEncode());
+  outer.setFreshnessPeriod(publication.freshnessPeriod);
+  outer.setContentType(ndn::tlv::Data);
+  outer.setFinalBlock(finalBlock);
+  {
+    std::lock_guard<std::mutex> lock(m_asyncPublishSigningMutex);
+    m_securityOptions.dataSigner->sign(outer);
+  }
+  outer.wireEncode();
+  return outer;
+}
+
+std::vector<Data>
+SVSPubSub::prepareSegmentedPackets(const AsyncPublication& publication)
+{
+  if (publication.value.empty()) {
+    throw std::invalid_argument("cannot segment an empty publication");
+  }
+
+  // FinalBlock changes the signed wire size. Rebuild until its value agrees
+  // with the number of packets found by actual signed-outer fitting.
+  size_t finalGuess = (publication.value.size() - 1) / MAX_DATA_SIZE;
+  for (size_t pass = 0; pass < 16; ++pass) {
+    auto finalBlock = name::Component::fromSegment(finalGuess);
+    std::vector<Data> packets;
+    size_t offset = 0;
+    while (offset < publication.value.size()) {
+      const size_t upper = std::min(MAX_DATA_SIZE, publication.value.size() - offset);
+      size_t low = 1;
+      size_t high = upper;
+      size_t best = 0;
+      std::optional<Data> bestPacket;
+      const size_t segmentNo = packets.size();
+
+      while (low <= high) {
+        const size_t candidate = low + (high - low) / 2;
+        auto packet = prepareOuterSegment(publication, segmentNo, finalBlock,
+                                          offset, candidate);
+        if (isFinalPacketSizeAllowed(packet.wireEncode().size())) {
+          best = candidate;
+          bestPacket = std::move(packet);
+          low = candidate + 1;
+        }
+        else {
+          high = candidate - 1;
+        }
+      }
+
+      if (best == 0 || !bestPacket) {
+        throw std::length_error("signed SVS segment cannot fit MAX_NDN_PACKET_SIZE");
+      }
+      packets.push_back(std::move(*bestPacket));
+      offset += best;
+    }
+
+    const size_t actualFinal = packets.size() - 1;
+    if (actualFinal == finalGuess) {
+      for (const auto& packet : packets) {
+        if (!isFinalPacketSizeAllowed(packet.wireEncode().size())) {
+          throw std::length_error("final signed SVS segment exceeds packet limit");
+        }
+      }
+      return packets;
+    }
+    finalGuess = actualFinal;
+  }
+  throw std::runtime_error("segmented FinalBlock fitting did not converge");
 }
 
 SVSPubSub::PreparedPublication
@@ -378,8 +421,6 @@ SVSPubSub::prepareReservedNameOnly(const AsyncPublication& publication)
   prepared.mappingName = publication.name;
   prepared.freshnessPeriod = publication.freshnessPeriod;
   prepared.mappingBlocks = publication.mappingBlocks;
-  insertMapping(publication.nodePrefix, publication.bootstrapTime, publication.seqNo,
-                publication.name, publication.mappingBlocks);
   return prepared;
 }
 
@@ -405,10 +446,7 @@ SVSPubSub::prepareReservedPacket(const AsyncPublication& publication)
     m_securityOptions.dataSigner->sign(outer);
   }
   outer.wireEncode();
-  m_svsync.insertPreparedData(outer, false);
   prepared.outerPackets.push_back(std::move(outer));
-  insertMapping(publication.nodePrefix, publication.bootstrapTime, publication.seqNo,
-                publication.packet.getName(), publication.mappingBlocks);
   return prepared;
 }
 
@@ -418,6 +456,13 @@ SVSPubSub::onPreparedPublication(PreparedPublication publication)
   const auto nodePrefix = publication.nodePrefix;
   {
     std::lock_guard<std::mutex> lock(m_asyncPublishMutex);
+    auto stagedNode = m_stagedPublicationPackets.find(nodePrefix);
+    if (stagedNode != m_stagedPublicationPackets.end()) {
+      stagedNode->second.erase(publication.seqNo);
+      if (stagedNode->second.empty()) {
+        m_stagedPublicationPackets.erase(stagedNode);
+      }
+    }
     m_preparedPublications[nodePrefix][publication.seqNo] = std::move(publication);
   }
   commitReadyPreparedPublications(nodePrefix);
@@ -426,9 +471,8 @@ SVSPubSub::onPreparedPublication(PreparedPublication publication)
 void
 SVSPubSub::commitReadyPreparedPublications(const NodeID& nid)
 {
-  std::vector<PreparedPublication> ready;
-  SeqNo highestSeq = 0;
   while (true) {
+    PreparedPublication publication;
     {
       std::lock_guard<std::mutex> lock(m_asyncPublishMutex);
       auto nextIt = m_nextAsyncCommitSeq.find(nid);
@@ -443,40 +487,135 @@ SVSPubSub::commitReadyPreparedPublications(const NodeID& nid)
       if (pubIt == nodeIt->second.end()) {
         break;
       }
-      highestSeq = pubIt->second.seqNo;
-      ready.push_back(std::move(pubIt->second));
+      if (pubIt->second.retryScheduled) {
+        break;
+      }
+      publication = std::move(pubIt->second);
       nodeIt->second.erase(pubIt);
       if (nodeIt->second.empty()) {
         m_preparedPublications.erase(nodeIt);
       }
-      ++nextIt->second;
+    }
+    auto requeueFailedPublication = [&] {
+      const auto failedSeq = publication.seqNo;
+      ++publication.commitAttempts;
+      publication.retryScheduled = true;
+      {
+        std::lock_guard<std::mutex> lock(m_asyncPublishMutex);
+        m_preparedPublications[nid][failedSeq] = std::move(publication);
+      }
+      schedulePreparedPublicationRetry(nid, failedSeq);
+    };
+    try {
+      if (m_preparedPublicationCommitHook) {
+        m_preparedPublicationCommitHook(publication.seqNo);
+      }
+      commitPreparedPublication(publication);
+      m_svsync.getCore().updateSeqNo(publication.seqNo, nid);
+    }
+    catch (const std::exception& e) {
+      NDN_LOG_ERROR("event=async_publish_commit_failed node=" << publication.nodePrefix
+                    << " seq=" << publication.seqNo << " error=" << e.what());
+      requeueFailedPublication();
+      break;
+    }
+    catch (...) {
+      NDN_LOG_ERROR("event=async_publish_commit_failed node=" << publication.nodePrefix
+                    << " seq=" << publication.seqNo << " error=unknown");
+      requeueFailedPublication();
+      break;
+    }
+    {
+      std::lock_guard<std::mutex> lock(m_asyncPublishMutex);
+      auto nextIt = m_nextAsyncCommitSeq.find(nid);
+      if (nextIt != m_nextAsyncCommitSeq.end() && nextIt->second == publication.seqNo) {
+        ++nextIt->second;
+      }
     }
   }
-
-  if (ready.empty()) {
-    return;
-  }
-
-  for (const auto& publication : ready) {
-    commitPreparedPublication(publication);
-  }
-  m_svsync.getCore().updateSeqNo(highestSeq, nid);
 }
 
 void
-SVSPubSub::commitPreparedPublication(const PreparedPublication& publication)
+SVSPubSub::schedulePreparedPublicationRetry(const NodeID& nid, SeqNo seqNo)
+{
+  size_t attempts = 1;
+  {
+    std::lock_guard<std::mutex> lock(m_asyncPublishMutex);
+    auto nodeIt = m_preparedPublications.find(nid);
+    if (nodeIt == m_preparedPublications.end()) {
+      return;
+    }
+    auto pubIt = nodeIt->second.find(seqNo);
+    if (pubIt == nodeIt->second.end()) {
+      return;
+    }
+    attempts = pubIt->second.commitAttempts;
+  }
+  const auto multiplier = int64_t{1} << std::min<size_t>(attempts - 1, 10);
+  const auto delay = time::milliseconds(std::max<int64_t>(1, std::min(
+    m_opts.asyncCommitRetryMax.count(),
+    m_opts.asyncCommitRetryInitial.count() * multiplier)));
+  auto alive = m_asyncPublishAlive;
+  m_scheduler.schedule(delay, [this, alive, nid, seqNo] {
+    if (!alive || !alive->load(std::memory_order_relaxed)) {
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(m_asyncPublishMutex);
+      auto nodeIt = m_preparedPublications.find(nid);
+      if (nodeIt == m_preparedPublications.end()) {
+        return;
+      }
+      auto pubIt = nodeIt->second.find(seqNo);
+      if (pubIt == nodeIt->second.end()) {
+        return;
+      }
+      pubIt->second.retryScheduled = false;
+    }
+    commitReadyPreparedPublications(nid);
+  });
+}
+
+void
+SVSPubSub::commitPreparedPublication(PreparedPublication& publication)
 {
   if (!publication.ok) {
-    return;
+    throw std::runtime_error("publication preparation failed");
+  }
+
+  if (!publication.stored) {
+    m_svsync.insertPreparedDataBatch(publication.outerPackets);
+    publication.stored = !publication.outerPackets.empty();
+  }
+  try {
+    insertMapping(publication.nodePrefix, publication.bootstrapTime, publication.seqNo,
+                  publication.mappingName, publication.mappingBlocks);
+
+    if (publication.piggyPacket) {
+      std::lock_guard<std::mutex> lock(m_extraDataMutex);
+      m_piggyDataQueue.push_back({*publication.piggyPacket, 0});
+    }
+  }
+  catch (...) {
+    if (publication.stored && !m_svsync.removePreparedDataBatch(publication.outerPackets)) {
+      throw std::runtime_error("publication rollback failed after commit error");
+    }
+    publication.stored = false;
+    throw;
   }
 
   if (publication.putFirstPacketToFace && !publication.outerPackets.empty()) {
-    m_svsync.putPreparedData(publication.outerPackets.front());
-  }
-
-  if (publication.piggyPacket) {
-    std::lock_guard<std::mutex> lock(m_extraDataMutex);
-    m_piggyDataQueue.push_back({*publication.piggyPacket, 0});
+    try {
+      m_svsync.putPreparedData(publication.outerPackets.front());
+    }
+    catch (const std::exception& e) {
+      NDN_LOG_WARN("event=async_publish_active_put_failed node=" << publication.nodePrefix
+                   << " seq=" << publication.seqNo << " error=" << e.what());
+    }
+    catch (...) {
+      NDN_LOG_WARN("event=async_publish_active_put_failed node=" << publication.nodePrefix
+                   << " seq=" << publication.seqNo << " error=unknown");
+    }
   }
 }
 

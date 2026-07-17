@@ -379,6 +379,12 @@ public:
     return m_scheduler;
   }
 
+  void
+  setLocalPublicationSyncHookForTest(std::function<void()> hook)
+  {
+    m_localPublicationSyncHook = std::move(hook);
+  }
+
   /// @brief Get the current time in microseconds with arbitrary reference
   long getCurrentTime() const;
 
@@ -473,6 +479,7 @@ private:
   bool m_initialized = false;
   std::atomic<bool> m_syncInterestBatching{false};
   time::milliseconds m_syncInterestBatchWindow = 5_ms;
+  std::function<void()> m_localPublicationSyncHook;
 
   std::atomic<bool> m_parallelSyncProcessing{false};
   std::shared_ptr<ValidationGate> m_validationGate = std::make_shared<ValidationGate>();

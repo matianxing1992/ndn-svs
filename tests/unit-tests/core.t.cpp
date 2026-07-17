@@ -432,6 +432,33 @@ BOOST_AUTO_TEST_CASE(PublicationSyncBatchingCoalescesLocalUpdates)
   BOOST_CHECK_EQUAL(sentVector.get("local-node"), 10);
 }
 
+BOOST_AUTO_TEST_CASE(PublicationSyncSendFailurePreservesCommittedLocalVersion)
+{
+  size_t hookCalls = 0;
+  m_core.setLocalPublicationSyncHookForTest([&] {
+    ++hookCalls;
+    throw std::runtime_error("injected post-commit Sync send failure");
+  });
+
+  BOOST_CHECK_NO_THROW(m_core.updateSeqNo(1, "local-node"));
+  BOOST_CHECK_EQUAL(hookCalls, 1);
+  BOOST_CHECK_EQUAL(m_core.getSeqNo("local-node"), 1);
+
+  m_core.setLocalPublicationSyncHookForTest({});
+  BOOST_CHECK_NO_THROW(m_core.updateSeqNo(2, "local-node"));
+  BOOST_CHECK_EQUAL(m_core.getSeqNo("local-node"), 2);
+
+  m_core.setSyncInterestBatching(true, 1_ms);
+  m_core.setLocalPublicationSyncHookForTest([&] {
+    ++hookCalls;
+    throw std::runtime_error("injected batched post-commit Sync send failure");
+  });
+  BOOST_CHECK_NO_THROW(m_core.updateSeqNo(3, "local-node"));
+  runIoUntil(m_face, [&] { return hookCalls == 2; });
+  BOOST_CHECK_EQUAL(hookCalls, 2);
+  BOOST_CHECK_EQUAL(m_core.getSeqNo("local-node"), 3);
+}
+
 BOOST_AUTO_TEST_CASE(ParallelSyncProductionHandling)
 {
   m_core.setParallelSyncProduction(true, 2, 16);
