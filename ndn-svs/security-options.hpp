@@ -19,6 +19,8 @@
 
 #include "common.hpp"
 
+#include <ndn-cxx/security/interest-signer.hpp>
+
 namespace ndn::svs {
 
 /**
@@ -78,6 +80,7 @@ class KeyChainSigner : public BaseSigner
 public:
   explicit KeyChainSigner(KeyChain& keyChain)
     : m_keyChain(keyChain)
+    , m_interestSigner(keyChain)
   {
   }
 
@@ -87,6 +90,7 @@ public:
 
 private:
   KeyChain& m_keyChain;
+  mutable security::InterestSigner m_interestSigner;
 };
 
 /**
