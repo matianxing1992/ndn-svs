@@ -43,6 +43,18 @@ runIoUntil(Face& face, const std::function<bool()>& done)
   }
 }
 
+static void
+runIoFor(Face& face, time::milliseconds duration)
+{
+  auto deadline = std::chrono::steady_clock::now() +
+                  std::chrono::milliseconds(duration.count());
+  while (std::chrono::steady_clock::now() < deadline) {
+    face.getIoContext().restart();
+    face.getIoContext().run_for(10ms);
+    std::this_thread::sleep_for(1ms);
+  }
+}
+
 BOOST_AUTO_TEST_SUITE(TestSVSPubSub)
 
 BOOST_AUTO_TEST_CASE(TypedPiggybackLimitControlsPublicationQueue)
@@ -228,6 +240,36 @@ BOOST_AUTO_TEST_CASE(LatePiggyDataStillSatisfiesPendingFetch)
   BOOST_CHECK_EQUAL(payload, body);
   BOOST_CHECK_EQUAL(producer, Name("/peer"));
   BOOST_CHECK_EQUAL(receivedSeq, 1);
+}
+
+BOOST_AUTO_TEST_CASE(MappingFetchSuppressesDuplicateInFlightRange)
+{
+  DummyClientFace face;
+  SVSPubSubOptions opts;
+  opts.useTimestamp = false;
+  opts.mappingFetchRetries = 0;
+
+  SVSPubSub pubsub("/sync", "/local", face,
+                   [] (const std::vector<MissingDataInfo>&) {},
+                   opts);
+  pubsub.subscribe("/app", [] (const SVSPubSub::SubscriptionData&) {});
+  runIoFor(face, 20_ms);
+  face.sentInterests.clear();
+
+  MissingDataInfo missing;
+  missing.nodeId = "/offline";
+  missing.bootstrapTime = 300;
+  missing.low = 1;
+  missing.high = 2;
+
+  pubsub.updateCallbackInternal({missing});
+  runIoUntil(face, [&] { return !face.sentInterests.empty(); });
+  BOOST_REQUIRE_EQUAL(face.sentInterests.size(), 1);
+  const auto firstInterest = face.sentInterests.front().getName();
+
+  pubsub.updateCallbackInternal({missing});
+  BOOST_CHECK_EQUAL(face.sentInterests.size(), 1);
+  BOOST_CHECK_EQUAL(face.sentInterests.front().getName(), firstInterest);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

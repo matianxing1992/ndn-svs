@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <set>
 
 namespace ndn::svs {
 
@@ -600,17 +601,7 @@ SVSPubSub::updateCallbackInternal(const std::vector<MissingDataInfo>& info)
           truncatedRemainingInfo.high = truncatedRemainingInfo.low + 10;
         }
 
-        m_mappingProvider.fetchNameMapping(
-          truncatedRemainingInfo,
-          [this, remainingInfo, streamName](const MappingList& list) {
-            bool queued = false;
-            for (const auto& entry : list.pairs)
-              queued |= this->processMapping(streamName, entry.bootstrapTime, entry.seqNo);
-
-            if (queued)
-              this->fetchAll();
-          },
-          -1);
+        scheduleMappingFetch(truncatedRemainingInfo, streamName);
 
         remainingInfo.low += 11;
       }
@@ -710,6 +701,117 @@ SVSPubSub::processMapping(const NodeID& nodeId, BootstrapTime bootstrapTime, Seq
   }
 
   return queued;
+}
+
+void
+SVSPubSub::onFetchedNameMappings(const MissingDataInfo& requested,
+                                 const NodeID& streamName,
+                                 const MappingList& list)
+{
+  if (list.pairs.empty())
+    return;
+
+  const SeqNo requestedHigh = std::max(requested.high, requested.low);
+  std::set<SeqNo> returnedSeqs;
+  bool queued = false;
+  for (const auto& entry : list.pairs) {
+    if (entry.bootstrapTime == requested.bootstrapTime &&
+        entry.seqNo >= requested.low &&
+        entry.seqNo <= requestedHigh) {
+      returnedSeqs.insert(entry.seqNo);
+    }
+    queued |= processMapping(streamName, entry.bootstrapTime, entry.seqNo);
+  }
+
+  if (queued)
+    fetchAll();
+
+  std::optional<SeqNo> missingLow;
+  auto fetchMissingRange = [this, &requested, &streamName](SeqNo low, SeqNo high) {
+    MissingDataInfo missing = requested;
+    missing.low = low;
+    missing.high = high;
+    scheduleMappingFetch(missing, streamName);
+  };
+
+  for (SeqNo seq = requested.low; seq <= requestedHigh; ++seq) {
+    if (returnedSeqs.count(seq) == 0) {
+      if (!missingLow)
+        missingLow = seq;
+      continue;
+    }
+
+    if (missingLow) {
+      fetchMissingRange(*missingLow, seq - 1);
+      missingLow.reset();
+    }
+  }
+  if (missingLow)
+    fetchMissingRange(*missingLow, requestedHigh);
+}
+
+bool
+SVSPubSub::scheduleMappingFetch(const MissingDataInfo& requested,
+                                const NodeID& streamName)
+{
+  MissingDataInfo query = requested;
+  query.high = std::max(query.high, query.low);
+  const MappingFetchKey key(query.nodeId, query.bootstrapTime, query.low, query.high);
+  const auto now = std::chrono::steady_clock::now();
+
+  auto inFlight = m_mappingFetchInFlight.find(key);
+  if (inFlight != m_mappingFetchInFlight.end()) {
+    NDN_LOG_TRACE("event=mapping_fetch_suppress reason=in_flight node=" << query.nodeId
+                  << " bootstrap=" << query.bootstrapTime
+                  << " low=" << query.low
+                  << " high=" << query.high);
+    return false;
+  }
+
+  auto suppress = m_mappingFetchSuppressUntil.find(key);
+  if (suppress != m_mappingFetchSuppressUntil.end() && suppress->second > now) {
+    auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+      suppress->second - now);
+    NDN_LOG_TRACE("event=mapping_fetch_suppress reason=backoff node=" << query.nodeId
+                  << " bootstrap=" << query.bootstrapTime
+                  << " low=" << query.low
+                  << " high=" << query.high
+                  << " remaining_ms=" << remaining.count());
+    return false;
+  }
+
+  if (suppress != m_mappingFetchSuppressUntil.end())
+    m_mappingFetchSuppressUntil.erase(suppress);
+  m_mappingFetchInFlight[key] = true;
+
+  m_mappingProvider.fetchNameMapping(
+    query,
+    [this, query, streamName, key](const MappingList& list) {
+      this->markMappingFetchComplete(key);
+      this->onFetchedNameMappings(query, streamName, list);
+    },
+    [this, key](const Interest&) {
+      this->markMappingFetchFailed(key);
+    },
+    m_opts.mappingFetchRetries);
+  return true;
+}
+
+void
+SVSPubSub::markMappingFetchComplete(const MappingFetchKey& key)
+{
+  m_mappingFetchInFlight.erase(key);
+  m_mappingFetchSuppressUntil.erase(key);
+}
+
+void
+SVSPubSub::markMappingFetchFailed(const MappingFetchKey& key)
+{
+  m_mappingFetchInFlight.erase(key);
+  if (m_opts.mappingFetchFailureBackoff > 0_ms) {
+    m_mappingFetchSuppressUntil[key] = std::chrono::steady_clock::now() +
+      std::chrono::milliseconds(m_opts.mappingFetchFailureBackoff.count());
+  }
 }
 
 void
