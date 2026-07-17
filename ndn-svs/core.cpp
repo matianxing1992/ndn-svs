@@ -660,25 +660,30 @@ SVSyncCore::onSyncInterestValidatedSerial(const Interest& interest, bool countSe
   NDN_LOG_TRACE("event=state_vector_decode_done mode=serial key=" << traceKey <<
                 " elapsed_us=" << elapsedUs(decodeStart, SteadyClock::now()));
 
-  // Extensions are committed only after the complete core envelope decoded.
-  if (m_recvExtraBlock) {
-    for (const auto& extension : extensions) {
-      try {
-        m_recvExtraBlock(extension, vvOther);
-      }
-      catch (const std::exception& e) {
-        NDN_LOG_DEBUG("event=sync_extension_rejected type=" << extension.type() <<
-                      " error=" << e.what());
-      }
-    }
-  }
-
   // Merge state vector
   const auto compareStart = SteadyClock::now();
   NDN_LOG_TRACE("event=state_compare_start mode=serial key=" << traceKey);
   auto result = mergeStateVector(vvOther);
   NDN_LOG_TRACE("event=state_compare_done mode=serial key=" << traceKey <<
                 " elapsed_us=" << elapsedUs(compareStart, SteadyClock::now()));
+
+  // The core transition is authoritative and precedes the independent
+  // extension transaction in both serial and parallel modes.
+  if (!extensions.empty()) {
+    try {
+      if (m_recvExtraBlocks) {
+        m_recvExtraBlocks(extensions, vvOther);
+      }
+      else if (m_recvExtraBlock) {
+        for (const auto& extension : extensions) {
+          m_recvExtraBlock(extension, vvOther);
+        }
+      }
+    }
+    catch (const std::exception& e) {
+      NDN_LOG_DEBUG("event=sync_extension_collection_rejected error=" << e.what());
+    }
+  }
 
   const auto missingStart = SteadyClock::now();
   NDN_LOG_TRACE("event=missing_data_compute_start mode=serial key=" << traceKey);
@@ -766,15 +771,19 @@ SVSyncCore::processSyncInterestResult(SyncProcessingResult result)
     return;
   }
 
-  if (m_recvExtraBlock) {
-    for (const auto& extension : result.extensions) {
-      try {
-        m_recvExtraBlock(extension, result.remoteVector);
+  if (!result.extensions.empty()) {
+    try {
+      if (m_recvExtraBlocks) {
+        m_recvExtraBlocks(result.extensions, result.remoteVector);
       }
-      catch (const std::exception& e) {
-        NDN_LOG_DEBUG("event=sync_extension_rejected type=" << extension.type() <<
-                      " error=" << e.what());
+      else if (m_recvExtraBlock) {
+        for (const auto& extension : result.extensions) {
+          m_recvExtraBlock(extension, result.remoteVector);
+        }
       }
+    }
+    catch (const std::exception& e) {
+      NDN_LOG_DEBUG("event=sync_extension_collection_rejected error=" << e.what());
     }
   }
 

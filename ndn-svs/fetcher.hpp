@@ -22,6 +22,7 @@
 
 #include <ndn-cxx/util/scheduler.hpp>
 
+#include <atomic>
 #include <queue>
 
 namespace ndn::svs {
@@ -31,12 +32,21 @@ class Fetcher
 public:
   Fetcher(Face& face, const SecurityOptions& securityOptions);
 
+  ~Fetcher();
+
   void expressInterest(const ndn::Interest& interest,
                        const ndn::DataCallback& afterSatisfied,
                        const ndn::NackCallback& afterNacked,
                        const ndn::TimeoutCallback& afterTimeout,
                        int nRetries = 0,
                        const ndn::security::DataValidationFailureCallback& afterValidationFailed = nullptr);
+
+  void
+  setWindowSize(uint16_t windowSize)
+  {
+    m_windowSize = std::max<uint16_t>(1, windowSize);
+    processQueue();
+  }
 
 private:
   struct QueuedInterest;
@@ -55,6 +65,7 @@ private:
   Face& m_face;
   ndn::Scheduler m_scheduler;
   const SecurityOptions m_securityOptions;
+  std::shared_ptr<std::atomic_bool> m_alive;
 
   uint64_t m_interestIdCounter = 0;
   uint16_t m_windowSize = 10;

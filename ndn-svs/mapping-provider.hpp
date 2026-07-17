@@ -112,6 +112,12 @@ public:
                         const TimeoutCallback& onTimeout,
                         int nRetries = 0);
 
+  void
+  setFetchWindowSize(uint16_t windowSize)
+  {
+    m_fetcher.setWindowSize(windowSize);
+  }
+
 NDN_SVS_PUBLIC_WITH_TESTS_ELSE_PRIVATE:
   /**
    * @brief Return data name for mapping query

@@ -36,6 +36,8 @@
 #include <optional>
 #include <tuple>
 
+#include <boost/asio/thread_pool.hpp>
+
 namespace ndn::svs {
 
 /**
@@ -77,13 +79,12 @@ struct SVSPubSubOptions
    * @brief Number of retries for network mapping fetches.
    *
    * Missing mapping providers can occur when a short-lived publisher exits
-   * after announcing a sequence number. The default preserves the historical
-   * unbounded retry behavior inside one fetch attempt, while SVSPubSub now
-   * suppresses duplicate in-flight fetches for the same mapping range. Set to
-   * a non-negative value to bound each fetch attempt and allow timeout/backoff
-   * suppression for deployments that prefer stale-range negative caching.
+   * after announcing a sequence number. The default bounds each fetch attempt
+   * to the initial Interest, then lets SVSPubSub apply timeout/backoff
+   * suppression for the same mapping range. Set to a negative value only if an
+   * application explicitly wants the historical unbounded retry behavior.
    */
-  int mappingFetchRetries = -1;
+  int mappingFetchRetries = 0;
 
   /**
    * @brief Backoff after a mapping query for a remote producer times out.
@@ -95,7 +96,73 @@ struct SVSPubSubOptions
    * a bounded fetch attempt times out. It is only reached when
    * mappingFetchRetries is non-negative.
    */
-  time::milliseconds mappingFetchFailureBackoff = 30_s;
+  time::milliseconds mappingFetchFailureBackoff = 200_ms;
+
+  /**
+   * @brief Separate window for mapping fetches.
+   */
+  uint16_t mappingFetchWindow = 10;
+
+  /**
+   * @brief Number of retries for publication Data fetches after a Sync update.
+   *
+   * This path is used when publication Data was not received through Sync
+   * Interest piggybacking and must be fetched by name. A lossy network can
+   * drop either the Interest or the Data, so this retry budget should be large
+   * enough for the application timeout.
+   */
+  int publicationFetchRetries = 2;
+
+  /**
+   * @brief Number of immediate Interest retries inside one publication fetch attempt.
+   */
+  int publicationFetchInnerRetries = 2;
+
+  /**
+   * @brief Interest lifetime for publication Data fetches.
+   */
+  time::milliseconds publicationFetchInterestLifetime = 500_ms;
+
+  /**
+   * @brief Lower bound for adaptive publication fetch Interest lifetime.
+   */
+  time::milliseconds publicationFetchMinInterestLifetime = 250_ms;
+
+  /**
+   * @brief Upper bound for adaptive publication fetch Interest lifetime.
+   */
+  time::milliseconds publicationFetchMaxInterestLifetime = 2_s;
+
+  /**
+   * @brief Backoff before retrying a publication fetch after one fetch
+   * attempt exhausts its retry budget.
+   */
+  time::milliseconds publicationFetchFailureBackoff = 50_ms;
+
+  /**
+   * @brief Maximum adaptive backoff between publication fetch attempts.
+   */
+  time::milliseconds publicationFetchMaxBackoff = 2_s;
+
+  /**
+   * @brief Separate window for publication Data fetches.
+   */
+  uint16_t publicationFetchWindow = 10;
+
+  /**
+   * @brief Number of Sync rounds a small publication/mapping may be repeated.
+   */
+  size_t piggybackRepeatCount = 3;
+
+  /**
+   * @brief Number of skipped Sync rounds before dropping a pending piggyback.
+   */
+  size_t piggybackMissLimit = 3;
+
+  /**
+   * @brief Number of Sync rounds a repair request may be repeated.
+   */
+  size_t repairRequestRepeatCount = 3;
 
   /** @brief Initial delay before retrying a failed asynchronous commit head. */
   time::milliseconds asyncCommitRetryInitial = 10_ms;
@@ -296,6 +363,7 @@ NDN_SVS_PUBLIC_WITH_TESTS_ELSE_PRIVATE:
 
   using PublicationKey = std::tuple<Name, BootstrapTime, SeqNo>;
   using MappingFetchKey = std::tuple<Name, BootstrapTime, SeqNo, SeqNo>;
+  using ProducerSessionKey = std::tuple<Name, BootstrapTime>;
 
   void onSyncData(const Data& syncData, const PublicationKey& publication);
 
@@ -303,7 +371,11 @@ NDN_SVS_PUBLIC_WITH_TESTS_ELSE_PRIVATE:
 
   Block onGetExtraData(const VersionVector& vv);
 
+  std::vector<Block> onGetExtraBlocks(const VersionVector& vv);
+
   void onRecvExtraData(const Block& block, const VersionVector& vv);
+
+  void onRecvExtraBlocks(const std::vector<Block>& blocks, const VersionVector& vv);
 
   bool
   satisfyPendingFetchFromPiggyData(const Data& data);
@@ -325,6 +397,8 @@ NDN_SVS_PUBLIC_WITH_TESTS_ELSE_PRIVATE:
    */
   bool processMapping(const NodeID& nodeId, BootstrapTime bootstrapTime, SeqNo seqNo);
 
+  void addPublicationFetch(const PublicationKey& publication, const Subscription& sub);
+
   void onFetchedNameMappings(const MissingDataInfo& requested,
                              const NodeID& streamName,
                              const MappingList& list);
@@ -335,6 +409,14 @@ NDN_SVS_PUBLIC_WITH_TESTS_ELSE_PRIVATE:
   void markMappingFetchComplete(const MappingFetchKey& key);
 
   void markMappingFetchFailed(const MappingFetchKey& key);
+
+  void markPublicationFetchFailed(const PublicationKey& key);
+
+  void observePublicationFetchSuccess(const PublicationKey& key);
+
+  void rememberRepairRequest(const PublicationKey& key);
+
+  void enqueueRepairPublication(const PublicationKey& key);
 
   void fetchAll();
 
@@ -380,10 +462,58 @@ NDN_SVS_PUBLIC_WITH_TESTS_ELSE_PRIVATE:
     bool retryScheduled = false;
   };
 
+  struct InnerSegmentAssembly
+  {
+    Name name;
+    std::vector<uint8_t> payload;
+  };
+
   struct PiggyDataEntry
   {
     Data data;
+    size_t sent = 0;
     size_t missed = 0;
+  };
+
+  struct PiggyMappingEntry
+  {
+    NodeID nodeId;
+    MappingEntry mapping;
+    size_t sent = 0;
+    size_t missed = 0;
+  };
+
+  struct RepairRequestEntry
+  {
+    MissingDataInfo info;
+    size_t sent = 0;
+    size_t missed = 0;
+  };
+
+  enum class PublicationFetchStatus
+  {
+    Queued,
+    Fetching,
+    Backoff,
+    Delivered,
+    Expired,
+  };
+
+  struct PublicationFetchState
+  {
+    PublicationFetchStatus status = PublicationFetchStatus::Queued;
+    size_t attempts = 0;
+    std::chrono::steady_clock::time_point firstQueued;
+    std::chrono::steady_clock::time_point deadline;
+    std::chrono::steady_clock::time_point nextAttempt;
+    std::chrono::steady_clock::time_point attemptStarted;
+    time::milliseconds currentLifetime = 0_ms;
+    time::milliseconds currentBackoff = 0_ms;
+  };
+
+  struct PublicationLifetimeEstimate
+  {
+    time::milliseconds lifetime = 0_ms;
   };
 
   SeqNo
@@ -422,6 +552,21 @@ NDN_SVS_PUBLIC_WITH_TESTS_ELSE_PRIVATE:
   isFinalPacketSizeAllowed(size_t wireSize)
   {
     return wireSize <= MAX_NDN_PACKET_SIZE;
+  }
+
+  static std::optional<InnerSegmentAssembly>
+  decodeInnerSegments(const std::vector<Block>& blocks);
+
+  void
+  addFetchForTest(const PublicationKey& publication, Subscription subscription)
+  {
+    m_fetchMap[publication].push_back(std::move(subscription));
+  }
+
+  bool
+  hasFetchForTest(const PublicationKey& publication) const
+  {
+    return m_fetchMap.count(publication) != 0;
   }
 
   void
@@ -476,7 +621,8 @@ private:
 
   // Queue of publications to fetch
   std::map<PublicationKey, std::vector<Subscription>> m_fetchMap;
-  std::map<PublicationKey, bool> m_fetchingMap;
+  std::map<PublicationKey, PublicationFetchState> m_publicationFetchStates;
+  std::map<ProducerSessionKey, PublicationLifetimeEstimate> m_publicationLifetimeEstimates;
   std::map<MappingFetchKey, bool> m_mappingFetchInFlight;
   std::map<MappingFetchKey, std::chrono::steady_clock::time_point> m_mappingFetchSuppressUntil;
 
@@ -485,6 +631,8 @@ private:
   // Pending piggyback Data. Newer entries are tried first; entries that miss
   // several Sync Interest opportunities are dropped and peers fetch normally.
   std::deque<PiggyDataEntry> m_piggyDataQueue;
+  std::deque<PiggyMappingEntry> m_piggyMappingQueue;
+  std::deque<RepairRequestEntry> m_repairRequestQueue;
   // A bounded cache for received piggyback Data. This intentionally avoids
   // ndn-cxx InMemoryStorage because SVS can touch this path from sync callback
   // and subscription delivery paths close together when parallel sync is enabled.

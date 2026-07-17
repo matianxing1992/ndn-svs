@@ -227,6 +227,16 @@ public:
     return *m_dataStore;
   }
 
+  void setFetchInterestLifetime(time::milliseconds lifetime)
+  {
+    m_fetchInterestLifetime = std::max(1_ms, lifetime);
+  }
+
+  void setFetchWindowSize(uint16_t windowSize)
+  {
+    m_fetcher.setWindowSize(windowSize);
+  }
+
   /** @brief Get the underlying SVS core */
   SVSyncCore& getCore()
   {

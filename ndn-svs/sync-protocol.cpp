@@ -4,6 +4,7 @@
 #include <cmath>
 #include <chrono>
 #include <iterator>
+#include <set>
 
 #ifdef NDN_SVS_COMPRESSION
 #include <ndn-cxx/encoding/buffer-stream.hpp>
@@ -70,7 +71,12 @@ SyncProtocolCodec::encode(const Name& groupPrefix,
   if (extensions.size() > MAX_EXTENSION_BLOCKS) {
     NDN_THROW(Error("too many SVS extension blocks"));
   }
+  std::set<uint32_t> knownExtensionTypes;
   for (const auto& extension : extensions) {
+    if ((extension.type() == tlv::MappingData || extension.type() == tlv::RepairData) &&
+        !knownExtensionTypes.insert(extension.type()).second) {
+      NDN_THROW(Error("duplicate known SVS extension"));
+    }
     if (extension.type() == tlv::StateVector || extension.type() == ndn::tlv::Data) {
       NDN_THROW(Error("extension collides with SVS core envelope"));
     }
@@ -165,6 +171,7 @@ SyncProtocolCodec::decode(const Interest& interest,
   }
 
   DecodedSyncEnvelope decoded;
+  std::set<uint32_t> knownExtensionTypes;
   auto first = params.elements_begin();
   if (version == SvsProtocolVersion::V3) {
     if (first->type() != ndn::tlv::Data) {
@@ -185,6 +192,10 @@ SyncProtocolCodec::decode(const Interest& interest,
       }
       if (it->type() == tlv::StateVector || it->type() == ndn::tlv::Data) {
         NDN_THROW(Error("duplicate SVS core envelope"));
+      }
+      if ((it->type() == tlv::MappingData || it->type() == tlv::RepairData) &&
+          !knownExtensionTypes.insert(it->type()).second) {
+        NDN_THROW(Error("duplicate known SVS extension"));
       }
       decoded.extensions.push_back(*it);
     }
@@ -211,6 +222,10 @@ SyncProtocolCodec::decode(const Interest& interest,
     }
     if (first->type() == tlv::StateVector || first->type() == ndn::tlv::Data) {
       NDN_THROW(Error("duplicate SVS core envelope"));
+    }
+    if ((first->type() == tlv::MappingData || first->type() == tlv::RepairData) &&
+        !knownExtensionTypes.insert(first->type()).second) {
+      NDN_THROW(Error("duplicate known SVS extension"));
     }
     decoded.extensions.push_back(*first);
   }
