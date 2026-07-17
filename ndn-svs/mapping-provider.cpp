@@ -164,10 +164,10 @@ MappingProvider::onMappingQuery(const Interest& interest)
       auto mapping = getMapping(query.nodeId, query.bootstrapTime, i);
       queryResponse.pairs.push_back({query.bootstrapTime, i, mapping});
     } catch (const std::exception&) {
-      // TODO: don't give up if not everything is found
-      // Instead return whatever we have and let the client request
-      // the remaining mappings again
-      return;
+      // A range query may race with mapping insertion or include sparse
+      // sequence numbers. Return the mappings we have instead of making the
+      // requester wait for the Interest lifetime and retry the whole range.
+      continue;
     }
   }
 

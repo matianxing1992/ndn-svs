@@ -31,6 +31,7 @@
 #include <mutex>
 #include <queue>
 #include <atomic>
+#include <chrono>
 #include <optional>
 #include <tuple>
 
@@ -72,6 +73,30 @@ struct SVSPubSubOptions
 
   /** @brief Maximum number of received piggyback Data packets retained in memory. */
   size_t piggyDataCacheLimit = 1024;
+
+  /**
+   * @brief Number of retries for network mapping fetches.
+   *
+   * Missing mapping providers can occur when a short-lived publisher exits
+   * after announcing a sequence number. The default preserves the historical
+   * unbounded retry behavior inside one fetch attempt, while SVSPubSub now
+   * suppresses duplicate in-flight fetches for the same mapping range. Set to
+   * a non-negative value to bound each fetch attempt and allow timeout/backoff
+   * suppression for deployments that prefer stale-range negative caching.
+   */
+  int mappingFetchRetries = -1;
+
+  /**
+   * @brief Backoff after a mapping query for a remote producer times out.
+   *
+   * A short-lived producer can publish Sync state and then exit before peers
+   * fetch its application-name mappings. Without a negative cache, every later
+   * Sync update can re-express the same MAPPING Interest for that dead session.
+   * This backoff suppresses duplicate queries for the same mapping range after
+   * a bounded fetch attempt times out. It is only reached when
+   * mappingFetchRetries is non-negative.
+   */
+  time::milliseconds mappingFetchFailureBackoff = 30_s;
 };
 
 /**
@@ -265,6 +290,7 @@ NDN_SVS_PUBLIC_WITH_TESTS_ELSE_PRIVATE:
   };
 
   using PublicationKey = std::tuple<Name, BootstrapTime, SeqNo>;
+  using MappingFetchKey = std::tuple<Name, BootstrapTime, SeqNo, SeqNo>;
 
   void onSyncData(const Data& syncData, const PublicationKey& publication);
 
@@ -293,6 +319,17 @@ NDN_SVS_PUBLIC_WITH_TESTS_ELSE_PRIVATE:
    * @throws std::exception error if mapping is not found
    */
   bool processMapping(const NodeID& nodeId, BootstrapTime bootstrapTime, SeqNo seqNo);
+
+  void onFetchedNameMappings(const MissingDataInfo& requested,
+                             const NodeID& streamName,
+                             const MappingList& list);
+
+  bool scheduleMappingFetch(const MissingDataInfo& requested,
+                            const NodeID& streamName);
+
+  void markMappingFetchComplete(const MappingFetchKey& key);
+
+  void markMappingFetchFailed(const MappingFetchKey& key);
 
   void fetchAll();
 
@@ -397,6 +434,8 @@ private:
   // Queue of publications to fetch
   std::map<PublicationKey, std::vector<Subscription>> m_fetchMap;
   std::map<PublicationKey, bool> m_fetchingMap;
+  std::map<MappingFetchKey, bool> m_mappingFetchInFlight;
+  std::map<MappingFetchKey, std::chrono::steady_clock::time_point> m_mappingFetchSuppressUntil;
 
   size_t m_maxApplicationParametersSize;
   size_t m_maxPiggyDataSize;
