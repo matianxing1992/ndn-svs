@@ -239,6 +239,8 @@ public:
   using GetExtraBlockCallback = std::function<ndn::Block(const VersionVector&)>;
   using GetExtraBlocksCallback = std::function<std::vector<ndn::Block>(const VersionVector&)>;
   using RecvExtraBlockCallback = std::function<void(const ndn::Block&, const VersionVector&)>;
+  using RecvExtraBlocksCallback =
+    std::function<void(const std::vector<ndn::Block>&, const VersionVector&)>;
 
   /**
    * @brief Callback to get extra data block for sync interest.
@@ -265,12 +267,24 @@ public:
   }
 
   /**
-   * @brief Callback on receiving extra data in a sync interest.
-   * Will be called BEFORE the interest is processed.
+   * @brief Legacy callback on receiving one extra block after core merge.
    */
   void setRecvExtraBlockCallback(const RecvExtraBlockCallback& callback)
   {
     m_recvExtraBlock = callback;
+    m_recvExtraBlocks = nullptr;
+  }
+
+  /**
+   * @brief Receive the complete bounded extension collection after core merge.
+   *
+   * Collection owners can validate every known block before committing any
+   * extension state. Installing this callback replaces the singular callback.
+   */
+  void setRecvExtraBlocksCallback(const RecvExtraBlocksCallback& callback)
+  {
+    m_recvExtraBlocks = callback;
+    m_recvExtraBlock = nullptr;
   }
 
   /// @brief Get current version vector
@@ -444,6 +458,7 @@ private:
   GetExtraBlockCallback m_getExtraBlock;
   GetExtraBlocksCallback m_getExtraBlocks;
   RecvExtraBlockCallback m_recvExtraBlock;
+  RecvExtraBlocksCallback m_recvExtraBlocks;
 
   // Max suppression time; this value is roughly
   // positively correlated to the network diameter

@@ -11,7 +11,6 @@
 
 #include "tests/boost-test.hpp"
 
-#include <ndn-cxx/security/signing-helpers.hpp>
 #include <ndn-cxx/util/dummy-client-face.hpp>
 #include <ndn-cxx/security/signing-helpers.hpp>
 
@@ -47,6 +46,31 @@ runIoUntil(Face& face, const std::function<bool()>& done)
   }
 }
 
+static void
+runIoFor(Face& face, time::milliseconds duration)
+{
+  auto deadline = std::chrono::steady_clock::now() +
+                  std::chrono::milliseconds(duration.count());
+  while (std::chrono::steady_clock::now() < deadline) {
+    face.getIoContext().restart();
+    face.getIoContext().run_for(10ms);
+    std::this_thread::sleep_for(1ms);
+  }
+}
+
+static size_t
+countChildBlocksOfType(Block block, uint32_t type)
+{
+  block.parse();
+  size_t count = 0;
+  for (const auto& child : block.elements()) {
+    if (child.type() == type) {
+      ++count;
+    }
+  }
+  return count;
+}
+
 class ThrowingDataSigner final : public BaseSigner
 {
 public:
@@ -55,7 +79,8 @@ public:
   {
   }
 
-  void sign(Data& data) const override
+  void
+  sign(Data& data) const override
   {
     const auto call = ++m_calls;
     if (call == m_failAt) {
@@ -64,8 +89,17 @@ public:
     m_delegate.sign(data);
   }
 
-  void failAt(size_t call) { m_failAt = call; }
-  void disableFailure() { m_failAt = std::numeric_limits<size_t>::max(); }
+  void
+  failAt(size_t call)
+  {
+    m_failAt = call;
+  }
+
+  void
+  disableFailure()
+  {
+    m_failAt = std::numeric_limits<size_t>::max();
+  }
 
 private:
   KeyChainSigner m_delegate;
@@ -76,7 +110,8 @@ private:
 class ThrowingDataStore final : public DataStore
 {
 public:
-  void insert(const Data& data) override
+  void
+  insert(const Data& data) override
   {
     const auto call = ++m_insertCalls;
     if (call == m_failAt) {
@@ -85,7 +120,8 @@ public:
     m_packets[data.getName()] = data;
   }
 
-  std::shared_ptr<const Data> find(const Interest& interest) override
+  std::shared_ptr<const Data>
+  find(const Interest& interest) override
   {
     for (const auto& [name, data] : m_packets) {
       if (interest.matchesData(data)) {
@@ -95,18 +131,48 @@ public:
     return nullptr;
   }
 
-  void erase(const Name& name) override
+  void
+  erase(const Name& name) override
   {
     m_erasedNames.push_back(name);
     m_packets.erase(name);
   }
 
-  bool supportsErase() const noexcept override { return true; }
-  void failAt(size_t call) { m_failAt = call; }
-  void disableFailure() { m_failAt = std::numeric_limits<size_t>::max(); }
-  size_t size() const { return m_packets.size(); }
-  const std::map<Name, Data>& packets() const { return m_packets; }
-  const std::vector<Name>& erasedNames() const { return m_erasedNames; }
+  bool
+  supportsErase() const noexcept override
+  {
+    return true;
+  }
+
+  void
+  failAt(size_t call)
+  {
+    m_failAt = call;
+  }
+
+  void
+  disableFailure()
+  {
+    m_failAt = std::numeric_limits<size_t>::max();
+  }
+
+  size_t
+  size() const
+  {
+    return m_packets.size();
+  }
+
+  const std::map<Name, Data>&
+  packets() const
+  {
+    return m_packets;
+  }
+
+  const std::vector<Name>&
+  erasedNames() const
+  {
+    return m_erasedNames;
+  }
 
 private:
   size_t m_insertCalls = 0;
@@ -118,9 +184,54 @@ private:
 class UnsupportedRollbackStore final : public DataStore
 {
 public:
-  std::shared_ptr<const Data> find(const Interest&) override { return nullptr; }
-  void insert(const Data&) override { ++m_insertCalls; }
+  std::shared_ptr<const Data> find(const Interest&) override
+  {
+    return nullptr;
+  }
+
+  void insert(const Data&) override
+  {
+    ++m_insertCalls;
+  }
+
   size_t m_insertCalls = 0;
+};
+
+class DeferredValidator final : public BaseValidator
+{
+public:
+  void
+  validate(const Data& data,
+           const security::DataValidationSuccessCallback& success,
+           const security::DataValidationFailureCallback& failure) override
+  {
+    m_data = data;
+    m_success = success;
+    m_failure = failure;
+  }
+
+  void
+  succeed()
+  {
+    BOOST_REQUIRE(m_success);
+    auto callback = std::move(m_success);
+    m_failure = nullptr;
+    callback(m_data);
+  }
+
+  void
+  reject()
+  {
+    BOOST_REQUIRE(m_failure);
+    auto callback = std::move(m_failure);
+    m_success = nullptr;
+    callback(m_data, ValidationError(1, "injected validation failure"));
+  }
+
+private:
+  Data m_data;
+  security::DataValidationSuccessCallback m_success;
+  security::DataValidationFailureCallback m_failure;
 };
 
 static std::vector<uint8_t>
@@ -131,6 +242,17 @@ makePayload(size_t size)
     payload[i] = static_cast<uint8_t>((i * 131 + 17) & 0xff);
   }
   return payload;
+}
+
+static Block
+makeInnerSegment(KeyChain& keyChain, const Name& baseName, size_t segmentNo,
+                 size_t finalSegment, span<const uint8_t> content)
+{
+  Data inner(Name(baseName).appendVersion(0).appendSegment(segmentNo));
+  inner.setContent(content);
+  inner.setFinalBlock(name::Component::fromSegment(finalSegment));
+  keyChain.sign(inner);
+  return inner.wireEncode();
 }
 
 static Data
@@ -153,18 +275,6 @@ makeSignedOuterPacketOfSize(KeyChain& keyChain, size_t target)
     }
   }
   throw std::runtime_error("unable to construct requested signed outer wire size");
-}
-
-static void
-runIoFor(Face& face, time::milliseconds duration)
-{
-  auto deadline = std::chrono::steady_clock::now() +
-                  std::chrono::milliseconds(duration.count());
-  while (std::chrono::steady_clock::now() < deadline) {
-    face.getIoContext().restart();
-    face.getIoContext().run_for(10ms);
-    std::this_thread::sleep_for(1ms);
-  }
 }
 
 BOOST_AUTO_TEST_SUITE(TestSVSPubSub)
@@ -384,19 +494,219 @@ BOOST_AUTO_TEST_CASE(MappingFetchSuppressesDuplicateInFlightRange)
   BOOST_CHECK_EQUAL(face.sentInterests.front().getName(), firstInterest);
 }
 
+BOOST_AUTO_TEST_CASE(MappingFetchBackoffSuppressesRetryAfterTimeout)
+{
+  DummyClientFace face;
+  SVSPubSubOptions opts;
+  opts.useTimestamp = false;
+  opts.mappingFetchRetries = 0;
+  opts.mappingFetchFailureBackoff = 30_s;
+
+  SVSPubSub pubsub("/sync", "/local", face,
+                   [] (const std::vector<MissingDataInfo>&) {},
+                   opts);
+  pubsub.subscribe("/app", [] (const SVSPubSub::SubscriptionData&) {});
+  runIoFor(face, 20_ms);
+  face.sentInterests.clear();
+
+  MissingDataInfo missing;
+  missing.nodeId = "/offline";
+  missing.bootstrapTime = 400;
+  missing.low = 1;
+  missing.high = 2;
+
+  pubsub.updateCallbackInternal({missing});
+  runIoUntil(face, [&] { return !face.sentInterests.empty(); });
+  BOOST_REQUIRE_EQUAL(face.sentInterests.size(), 1);
+
+  runIoFor(face, 2500_ms);
+  pubsub.updateCallbackInternal({missing});
+  BOOST_CHECK_EQUAL(face.sentInterests.size(), 1);
+}
+
+BOOST_AUTO_TEST_CASE(SmallDataIsPiggybackedAcrossMultipleRounds)
+{
+  DummyClientFace face;
+  SVSPubSubOptions opts;
+  opts.useTimestamp = false;
+  opts.piggybackRepeatCount = 2;
+
+  SVSPubSub pubsub("/sync", "/local", face,
+                   [] (const std::vector<MissingDataInfo>&) {},
+                   opts);
+
+  const std::string payload = "repeat";
+  pubsub.publish("/app/repeat",
+                 make_span(reinterpret_cast<const uint8_t*>(payload.data()), payload.size()));
+
+  auto first = pubsub.onGetExtraData(VersionVector());
+  auto second = pubsub.onGetExtraData(VersionVector());
+  auto third = pubsub.onGetExtraData(VersionVector());
+
+  BOOST_CHECK_GE(countChildBlocksOfType(first, ndn::tlv::Data), 1);
+  BOOST_CHECK_GE(countChildBlocksOfType(second, ndn::tlv::Data), 1);
+  BOOST_CHECK_EQUAL(countChildBlocksOfType(third, ndn::tlv::Data), 0);
+}
+
+BOOST_AUTO_TEST_CASE(PublicationFetchTimeoutBacksOffAndIncreasesLifetime)
+{
+  DummyClientFace face;
+  SVSPubSubOptions opts;
+  opts.useTimestamp = false;
+  opts.publicationFetchRetries = 1;
+  opts.publicationFetchInnerRetries = 0;
+  opts.publicationFetchWindow = 1;
+  opts.publicationFetchInterestLifetime = 50_ms;
+  opts.publicationFetchMinInterestLifetime = 50_ms;
+  opts.publicationFetchMaxInterestLifetime = 400_ms;
+  opts.publicationFetchFailureBackoff = 10_ms;
+  opts.publicationFetchMaxBackoff = 100_ms;
+
+  SVSPubSub pubsub("/sync", "/local", face,
+                   [] (const std::vector<MissingDataInfo>&) {},
+                   opts);
+  pubsub.subscribe("/app/item", [] (const SVSPubSub::SubscriptionData&) {});
+  runIoFor(face, 20_ms);
+  face.sentInterests.clear();
+
+  BootstrapTime bootstrapTime = 500;
+  pubsub.insertMapping("/peer", bootstrapTime, 1, "/app/item", {});
+  BOOST_CHECK(pubsub.processMapping("/peer", bootstrapTime, 1));
+  pubsub.fetchAll();
+  runIoUntil(face, [&] { return !face.sentInterests.empty(); });
+  BOOST_REQUIRE_EQUAL(face.sentInterests.size(), 1);
+  BOOST_CHECK_EQUAL(face.sentInterests.back().getInterestLifetime(), 50_ms);
+
+  runIoFor(face, 90_ms);
+  BOOST_REQUIRE_GE(face.sentInterests.size(), 2);
+  BOOST_CHECK_EQUAL(face.sentInterests.back().getInterestLifetime(), 100_ms);
+}
+
+BOOST_AUTO_TEST_CASE(RepairRequestRepiggybacksProducerData)
+{
+  DummyClientFace producerFace;
+  SVSPubSubOptions producerOpts;
+  producerOpts.useTimestamp = false;
+  producerOpts.piggybackRepeatCount = 1;
+  producerOpts.repairRequestRepeatCount = 1;
+
+  SVSPubSub producer("/sync", "/producer", producerFace,
+                     [] (const std::vector<MissingDataInfo>&) {},
+                     producerOpts);
+
+  const std::string payload = "repair";
+  auto seq = producer.publish("/app/repair",
+                              make_span(reinterpret_cast<const uint8_t*>(payload.data()),
+                                        payload.size()));
+  auto bootstrapTime = producer.getSVSync().getCore().getBootstrapTime();
+
+  // Drain the initial one-shot piggyback so the later Data comes from repair.
+  producer.onGetExtraData(VersionVector());
+  BOOST_CHECK_EQUAL(countChildBlocksOfType(producer.onGetExtraData(VersionVector()),
+                                           ndn::tlv::Data), 0);
+
+  DummyClientFace receiverFace;
+  SVSPubSubOptions receiverOpts;
+  receiverOpts.useTimestamp = false;
+  receiverOpts.repairRequestRepeatCount = 1;
+  SVSPubSub receiver("/sync", "/receiver", receiverFace,
+                     [] (const std::vector<MissingDataInfo>&) {},
+                     receiverOpts);
+
+  receiver.rememberRepairRequest(SVSPubSub::PublicationKey("/producer", bootstrapTime, seq));
+  auto repairBlock = receiver.onGetExtraData(VersionVector());
+  BOOST_CHECK_GE(countChildBlocksOfType(repairBlock, ndn::svs::tlv::RepairData), 1);
+
+  producer.onRecvExtraData(repairBlock, VersionVector());
+  auto repaired = producer.onGetExtraData(VersionVector());
+  BOOST_CHECK_GE(countChildBlocksOfType(repaired, ndn::tlv::Data), 1);
+}
+
+BOOST_AUTO_TEST_CASE(KnownExtensionPrepareCommitIsAtomic)
+{
+  DummyClientFace face;
+  SVSPubSubOptions opts;
+  opts.useTimestamp = false;
+  SVSPubSub pubsub("/sync/extension-atomic", "/local", face,
+                   [] (const auto&) {}, opts);
+
+  MappingList mapping("/peer");
+  mapping.pairs.push_back({1700000000, 1, {Name("/app/item"), {}}});
+  auto mixed = mapping.encode();
+  mixed.push_back(makeStringBlock(ndn::svs::tlv::RepairData, "malformed"));
+  mixed.encode();
+
+  pubsub.onRecvExtraData(mixed, VersionVector());
+  BOOST_CHECK_THROW(pubsub.processMapping("/peer", 1700000000, 1), std::out_of_range);
+
+  // The next valid extension still commits, proving rejection did not poison
+  // the extension parser or mapping state.
+  pubsub.onRecvExtraData(mapping.encode(), VersionVector());
+  BOOST_CHECK_NO_THROW(pubsub.processMapping("/peer", 1700000000, 1));
+
+  BOOST_CHECK_NO_THROW(pubsub.onRecvExtraData(Block(0xF001), VersionVector()));
+}
+
+BOOST_AUTO_TEST_CASE(KnownExtensionsAreDistinctTopLevelBlocks)
+{
+  DummyClientFace face;
+  SVSPubSubOptions opts;
+  opts.useTimestamp = false;
+  opts.repairRequestRepeatCount = 1;
+  SVSPubSub pubsub("/sync/distinct-extensions", "/local", face,
+                   [] (const auto&) {}, opts);
+
+  pubsub.rememberRepairRequest(SVSPubSub::PublicationKey("/peer", 1700000000, 1));
+  const auto extensions = pubsub.onGetExtraBlocks(VersionVector());
+  BOOST_REQUIRE_EQUAL(extensions.size(), 2);
+  BOOST_CHECK_EQUAL(extensions.at(0).type(), ndn::svs::tlv::MappingData);
+  BOOST_CHECK_EQUAL(extensions.at(1).type(), ndn::svs::tlv::RepairData);
+  extensions.at(0).parse();
+  BOOST_CHECK(extensions.at(0).find(ndn::svs::tlv::RepairData) ==
+              extensions.at(0).elements_end());
+}
+
+BOOST_AUTO_TEST_CASE(KnownExtensionCollectionPrepareCommitIsAtomic)
+{
+  DummyClientFace face;
+  SVSPubSubOptions opts;
+  opts.useTimestamp = false;
+  SVSPubSub pubsub("/sync/extension-collection", "/local", face,
+                   [] (const auto&) {}, opts);
+
+  MappingList mapping("/peer");
+  mapping.pairs.push_back({1700000000, 1, {Name("/app/item"), {}}});
+  auto validMapping = mapping.encode();
+  auto malformedRepair = makeStringBlock(ndn::svs::tlv::RepairData, "malformed");
+
+  pubsub.onRecvExtraBlocks({validMapping, malformedRepair}, VersionVector());
+  BOOST_CHECK_THROW(pubsub.processMapping("/peer", 1700000000, 1), std::out_of_range);
+
+  pubsub.onRecvExtraBlocks({validMapping}, VersionVector());
+  BOOST_CHECK_NO_THROW(pubsub.processMapping("/peer", 1700000000, 1));
+}
+
 BOOST_AUTO_TEST_CASE(SegmentedPublicationFitsFinalSignedOuterBoundary)
 {
   KeyChain boundaryKeyChain("pib-memory:svspubsub-outer-boundary",
                             "tpm-memory:svspubsub-outer-boundary");
   boundaryKeyChain.createIdentity("/svspubsub-test/outer-boundary");
-  const auto below = makeSignedOuterPacketOfSize(boundaryKeyChain, MAX_NDN_PACKET_SIZE - 1);
-  const auto exact = makeSignedOuterPacketOfSize(boundaryKeyChain, MAX_NDN_PACKET_SIZE);
-  const auto above = makeSignedOuterPacketOfSize(boundaryKeyChain, MAX_NDN_PACKET_SIZE + 1);
+  const auto below = makeSignedOuterPacketOfSize(boundaryKeyChain,
+                                                  MAX_NDN_PACKET_SIZE - 1);
+  const auto exact = makeSignedOuterPacketOfSize(boundaryKeyChain,
+                                                  MAX_NDN_PACKET_SIZE);
+  const auto above = makeSignedOuterPacketOfSize(boundaryKeyChain,
+                                                  MAX_NDN_PACKET_SIZE + 1);
+  BOOST_CHECK_EQUAL(below.wireEncode().size(), MAX_NDN_PACKET_SIZE - 1);
+  BOOST_CHECK_EQUAL(exact.wireEncode().size(), MAX_NDN_PACKET_SIZE);
+  BOOST_CHECK_EQUAL(above.wireEncode().size(), MAX_NDN_PACKET_SIZE + 1);
   BOOST_CHECK(SVSPubSub::isFinalPacketSizeAllowed(below.wireEncode().size()));
   BOOST_CHECK(SVSPubSub::isFinalPacketSizeAllowed(exact.wireEncode().size()));
   BOOST_CHECK(!SVSPubSub::isFinalPacketSizeAllowed(above.wireEncode().size()));
 
-  for (const auto& applicationName : {Name("/short"), Name("/a/very/long/application/name")}) {
+  for (const auto& applicationName : {
+         Name("/short"),
+         Name("/a/very/long/application/name/whose/components/exercise/the/final/wire/budget")}) {
     DummyClientFace face;
     KeyChain keyChain("pib-memory:svspubsub-boundary", "tpm-memory:svspubsub-boundary");
     keyChain.createIdentity("/svspubsub-test/a/long/certificate/identity/for/segment/signing");
@@ -414,12 +724,15 @@ BOOST_AUTO_TEST_CASE(SegmentedPublicationFitsFinalSignedOuterBoundary)
       const auto payload = makePayload(payloadSize);
       BOOST_CHECK_NO_THROW(pubsub.publish(applicationName, payload));
       BOOST_REQUIRE_GT(store->size(), before);
+
       std::vector<uint8_t> reconstructed;
-      for (auto it = std::next(store->packets().begin(), before); it != store->packets().end(); ++it) {
+      for (auto it = std::next(store->packets().begin(), before);
+           it != store->packets().end(); ++it) {
         const auto& outer = it->second;
         BOOST_CHECK_LE(outer.wireEncode().size(), MAX_NDN_PACKET_SIZE);
         Data inner(outer.getContent().blockFromValue());
         const auto content = inner.getContent().value_bytes();
+        BOOST_CHECK(!content.empty());
         reconstructed.insert(reconstructed.end(), content.begin(), content.end());
       }
       BOOST_CHECK_EQUAL_COLLECTIONS(reconstructed.begin(), reconstructed.end(),
@@ -445,13 +758,18 @@ BOOST_AUTO_TEST_CASE(FailedSegmentPreparationDoesNotAdvanceVisibleSequence)
   SVSPubSub pubsub("/sync", "/producer", face,
                    [] (const std::vector<MissingDataInfo>&) {}, opts, securityOptions);
 
-  BOOST_CHECK_THROW(pubsub.publishAsync("/app/large", makePayload(16000)), std::runtime_error);
+  const auto large = makePayload(16000);
+  BOOST_CHECK_THROW(pubsub.publishAsync("/app/large", large), std::runtime_error);
   runIoFor(face, 20_ms);
   BOOST_CHECK_EQUAL(pubsub.getSVSync().getCore().getSeqNo("/producer"), 0);
   BOOST_CHECK_EQUAL(store->size(), 0);
+
   signer->disableFailure();
-  BOOST_CHECK_EQUAL(pubsub.publishAsync("/app/small", makePayload(64)), 1);
-  runIoUntil(face, [&] { return pubsub.getSVSync().getCore().getSeqNo("/producer") == 1; });
+  const auto small = makePayload(64);
+  BOOST_CHECK_EQUAL(pubsub.publishAsync("/app/small", small), 1);
+  runIoUntil(face, [&] {
+    return pubsub.getSVSync().getCore().getSeqNo("/producer") == 1;
+  });
   BOOST_CHECK_EQUAL(pubsub.getSVSync().getCore().getSeqNo("/producer"), 1);
 }
 
@@ -465,14 +783,21 @@ BOOST_AUTO_TEST_CASE(FailedSegmentStorageRollsBackAndKeepsProviderHealthy)
   opts.dataStore = store;
   SVSPubSub pubsub("/sync", "/producer", face,
                    [] (const std::vector<MissingDataInfo>&) {}, opts);
-  BOOST_CHECK_THROW(pubsub.publishAsync("/app/large", makePayload(16000)), std::runtime_error);
+
+  const auto large = makePayload(16000);
+  BOOST_CHECK_THROW(pubsub.publishAsync("/app/large", large), std::runtime_error);
   runIoFor(face, 20_ms);
   BOOST_CHECK_EQUAL(pubsub.getSVSync().getCore().getSeqNo("/producer"), 0);
   BOOST_CHECK_EQUAL(store->size(), 0);
   BOOST_REQUIRE_EQUAL(store->erasedNames().size(), 1);
+
   store->disableFailure();
-  BOOST_CHECK_EQUAL(pubsub.publishAsync("/app/small", makePayload(64)), 1);
-  runIoUntil(face, [&] { return pubsub.getSVSync().getCore().getSeqNo("/producer") == 1; });
+  const auto small = makePayload(64);
+  BOOST_CHECK_EQUAL(pubsub.publishAsync("/app/small", small), 1);
+  runIoUntil(face, [&] {
+    return pubsub.getSVSync().getCore().getSeqNo("/producer") == 1;
+  });
+  BOOST_CHECK_EQUAL(pubsub.getSVSync().getCore().getSeqNo("/producer"), 1);
 }
 
 BOOST_AUTO_TEST_CASE(FailedAsyncFacePutFallsBackToStoredPublication)
@@ -489,12 +814,26 @@ BOOST_AUTO_TEST_CASE(FailedAsyncFacePutFallsBackToStoredPublication)
     ++putCalls;
     throw std::runtime_error("injected Face::put failure");
   });
-  BOOST_CHECK_EQUAL(pubsub.publishAsync("/app/first", makePayload(64)), 1);
-  runIoUntil(face, [&] { return pubsub.getSVSync().getCore().getSeqNo("/producer") == 1; });
+
+  const auto small = makePayload(64);
+  BOOST_CHECK_EQUAL(pubsub.publishAsync("/app/first", small), 1);
+  BOOST_CHECK_EQUAL(putCalls, 0);
+  BOOST_CHECK_EQUAL(pubsub.getSVSync().getCore().getSeqNo("/producer"), 0);
+  BOOST_CHECK_GT(store->size(), 0);
+
+  runIoUntil(face, [&] {
+    return pubsub.getSVSync().getCore().getSeqNo("/producer") == 1;
+  });
   BOOST_CHECK_EQUAL(putCalls, 1);
+  BOOST_CHECK_EQUAL(pubsub.getSVSync().getCore().getSeqNo("/producer"), 1);
+  BOOST_CHECK_GT(store->size(), 0);
+
   pubsub.getSVSync().setPreparedDataPutHookForTest({});
-  BOOST_CHECK_EQUAL(pubsub.publishAsync("/app/second", makePayload(64)), 2);
-  runIoUntil(face, [&] { return pubsub.getSVSync().getCore().getSeqNo("/producer") == 2; });
+  BOOST_CHECK_EQUAL(pubsub.publishAsync("/app/second", small), 2);
+  runIoUntil(face, [&] {
+    return pubsub.getSVSync().getCore().getSeqNo("/producer") == 2;
+  });
+  BOOST_CHECK_EQUAL(pubsub.getSVSync().getCore().getSeqNo("/producer"), 2);
 }
 
 BOOST_AUTO_TEST_CASE(CommitFailureBlocksLaterPublicationUntilOrderedRetry)
@@ -507,19 +846,27 @@ BOOST_AUTO_TEST_CASE(CommitFailureBlocksLaterPublicationUntilOrderedRetry)
   opts.asyncCommitRetryInitial = 100_ms;
   SVSPubSub pubsub("/sync", "/producer", face,
                    [] (const std::vector<MissingDataInfo>&) {}, opts);
+
   size_t attempts = 0;
   pubsub.setPreparedPublicationCommitHookForTest([&] (SeqNo seqNo) {
     if (seqNo == 1 && ++attempts == 1) {
       throw std::runtime_error("injected commit-head failure");
     }
   });
-  BOOST_CHECK_EQUAL(pubsub.publishAsync("/app/one", makePayload(64)), 1);
-  BOOST_CHECK_EQUAL(pubsub.publishAsync("/app/two", makePayload(64)), 2);
+
+  const auto payload = makePayload(64);
+  BOOST_CHECK_EQUAL(pubsub.publishAsync("/app/one", payload), 1);
+  BOOST_CHECK_EQUAL(pubsub.publishAsync("/app/two", payload), 2);
   runIoFor(face, 20_ms);
   BOOST_CHECK_EQUAL(pubsub.getSVSync().getCore().getSeqNo("/producer"), 0);
   BOOST_CHECK_EQUAL(pubsub.getPreparedPublicationCountForTest("/producer"), 2);
-  runIoUntil(face, [&] { return pubsub.getSVSync().getCore().getSeqNo("/producer") == 2; });
+
+  runIoUntil(face, [&] {
+    return pubsub.getSVSync().getCore().getSeqNo("/producer") == 2;
+  });
+  BOOST_CHECK_EQUAL(pubsub.getSVSync().getCore().getSeqNo("/producer"), 2);
   BOOST_CHECK_EQUAL(pubsub.getPreparedPublicationCountForTest("/producer"), 0);
+  BOOST_CHECK_EQUAL(pubsub.getStagedPublicationCountForTest("/producer"), 0);
 }
 
 BOOST_AUTO_TEST_CASE(PersistentCommitFailureIsReclaimedOnShutdown)
@@ -539,6 +886,7 @@ BOOST_AUTO_TEST_CASE(PersistentCommitFailureIsReclaimedOnShutdown)
     BOOST_CHECK_EQUAL(pubsub.publishAsync("/app/blocked", makePayload(64)), 1);
     runIoFor(face, 20_ms);
     BOOST_CHECK_GT(store->size(), 0);
+    BOOST_CHECK_EQUAL(pubsub.getSVSync().getCore().getSeqNo("/producer"), 0);
   }
   BOOST_CHECK_EQUAL(store->size(), 0);
 }
@@ -552,8 +900,73 @@ BOOST_AUTO_TEST_CASE(UnsupportedRollbackStoreIsRejectedBeforeSinglePacketInsert)
   opts.dataStore = store;
   SVSPubSub pubsub("/sync", "/producer", face,
                    [] (const std::vector<MissingDataInfo>&) {}, opts);
+
   BOOST_CHECK_THROW(pubsub.publishAsync("/app/one", makePayload(64)), std::logic_error);
   BOOST_CHECK_EQUAL(store->m_insertCalls, 0);
+  BOOST_CHECK_EQUAL(pubsub.getSVSync().getCore().getSeqNo("/producer"), 0);
+}
+
+BOOST_AUTO_TEST_CASE(FetcherLateTerminalCallbacksAreHarmlessAfterDestruction)
+{
+  DummyClientFace face;
+  SecurityOptions options(SecurityOptions::DEFAULT);
+  size_t satisfied = 0;
+  size_t nacked = 0;
+  size_t timedOut = 0;
+  Interest interest("/late/fetcher");
+  interest.setInterestLifetime(10_ms);
+  {
+    Fetcher fetcher(face, options);
+    fetcher.expressInterest(interest,
+      [&] (const Interest&, const Data&) { ++satisfied; },
+      [&] (const Interest&, const lp::Nack&) { ++nacked; },
+      [&] (const Interest&) { ++timedOut; });
+  }
+
+  Data data(interest.getName());
+  data.setContent(makePayload(8));
+  KeyChain keyChain;
+  keyChain.sign(data, signingWithSha256());
+  face.receive(data);
+  lp::Nack nack(interest);
+  nack.setReason(lp::NackReason::NO_ROUTE);
+  face.receive(nack);
+  runIoFor(face, 30_ms);
+  BOOST_CHECK_EQUAL(satisfied, 0);
+  BOOST_CHECK_EQUAL(nacked, 0);
+  BOOST_CHECK_EQUAL(timedOut, 0);
+}
+
+BOOST_AUTO_TEST_CASE(FetcherValidationCallbacksAndRetryAreHarmlessAfterDestruction)
+{
+  DummyClientFace face;
+  auto validator = std::make_shared<DeferredValidator>();
+  SecurityOptions options(SecurityOptions::DEFAULT);
+  options.validator = validator;
+  options.nRetriesOnValidationFail = 1;
+  options.millisBeforeRetryOnValidationFail = 50;
+  size_t terminalCallbacks = 0;
+  Interest interest("/late/validation");
+  {
+    auto fetcher = std::make_unique<Fetcher>(face, options);
+    fetcher->expressInterest(interest,
+      [&] (const Interest&, const Data&) { ++terminalCallbacks; },
+      [&] (const Interest&, const lp::Nack&) { ++terminalCallbacks; },
+      [&] (const Interest&) { ++terminalCallbacks; });
+    runIoFor(face, 5_ms);
+    Data data(interest.getName());
+    data.setContent(makePayload(8));
+    KeyChain keyChain;
+    keyChain.sign(data, signingWithSha256());
+    face.receive(data);
+    runIoFor(face, 20_ms);
+    fetcher.reset();
+  }
+  BOOST_CHECK_NO_THROW(validator->reject());
+  const auto sentBeforeRetry = face.sentInterests.size();
+  runIoFor(face, 80_ms);
+  BOOST_CHECK_EQUAL(face.sentInterests.size(), sentBeforeRetry);
+  BOOST_CHECK_EQUAL(terminalCallbacks, 0);
 }
 
 BOOST_AUTO_TEST_CASE(ShutdownRollsBackStoredButUnadvertisedPublication)
@@ -566,10 +979,92 @@ BOOST_AUTO_TEST_CASE(ShutdownRollsBackStoredButUnadvertisedPublication)
   {
     SVSPubSub pubsub("/sync", "/producer", face,
                      [] (const std::vector<MissingDataInfo>&) {}, opts);
-    BOOST_CHECK_EQUAL(pubsub.publishAsync("/app/staged", makePayload(16000)), 1);
+    const auto large = makePayload(16000);
+    BOOST_CHECK_EQUAL(pubsub.publishAsync("/app/staged", large), 1);
     BOOST_CHECK_GT(store->size(), 0);
+    // Do not run the Face io_context: advertisement remains pending.
   }
   BOOST_CHECK_EQUAL(store->size(), 0);
+}
+
+BOOST_AUTO_TEST_CASE(InnerSegmentAssemblyRejectsMissingMalformedAndDuplicateSegments)
+{
+  KeyChain keyChain("pib-memory:svspubsub-assembly", "tpm-memory:svspubsub-assembly");
+  keyChain.createIdentity("/svspubsub-test/assembly");
+  const auto first = makePayload(4);
+  const auto second = makePayload(5);
+  const auto third = makePayload(6);
+
+  std::vector<Block> valid = {
+    makeInnerSegment(keyChain, "/app/item", 0, 2, first),
+    makeInnerSegment(keyChain, "/app/item", 1, 2, second),
+    makeInnerSegment(keyChain, "/app/item", 2, 2, third),
+  };
+  auto assembled = SVSPubSub::decodeInnerSegments(valid);
+  BOOST_REQUIRE(assembled.has_value());
+  BOOST_CHECK_EQUAL(assembled->payload.size(), first.size() + second.size() + third.size());
+
+  BOOST_CHECK(!SVSPubSub::decodeInnerSegments({valid[0], valid[2]}).has_value());
+  BOOST_CHECK(!SVSPubSub::decodeInnerSegments({valid[0], valid[0], valid[1], valid[2]}).has_value());
+  BOOST_CHECK(!SVSPubSub::decodeInnerSegments({Block(ndn::tlv::Content)}).has_value());
+}
+
+BOOST_AUTO_TEST_CASE(ValidationFailureAndLateCallbackReclaimFetchStateSafely)
+{
+  DummyClientFace face;
+  KeyChain keyChain("pib-memory:svspubsub-validation",
+                    "tpm-memory:svspubsub-validation");
+  keyChain.createIdentity("/svspubsub-test/validation");
+  SecurityOptions securityOptions(keyChain);
+  auto validator = std::make_shared<DeferredValidator>();
+  securityOptions.encapsulatedDataValidator = validator;
+  SVSPubSubOptions opts;
+  opts.useTimestamp = false;
+
+  SVSPubSub::PublicationKey publication("/peer", 10, 1);
+  {
+    SVSPubSub pubsub("/sync", "/local", face,
+                     [] (const std::vector<MissingDataInfo>&) {}, opts, securityOptions);
+    pubsub.addFetchForTest(publication,
+      {1, Name("/app"), [] (const SVSPubSub::SubscriptionData&) {}, false, false});
+
+    const auto payload = makePayload(64);
+    Data inner("/app/item");
+    inner.setContent(payload);
+    keyChain.sign(inner);
+    Data outer("/peer/sync/10/1");
+    outer.setContent(inner.wireEncode());
+    outer.setContentType(ndn::tlv::Data);
+    keyChain.sign(outer);
+
+    pubsub.onSyncData(outer, publication);
+    validator->reject();
+    BOOST_CHECK(!pubsub.hasFetchForTest(publication));
+
+    // Cleanup is idempotent: duplicate and late terminal events cannot revive state.
+    pubsub.cleanUpFetch(publication);
+    BOOST_CHECK(!pubsub.hasFetchForTest(publication));
+  }
+
+  // A validator callback retained past shutdown must be harmless.
+  auto lateValidator = std::make_shared<DeferredValidator>();
+  securityOptions.encapsulatedDataValidator = lateValidator;
+  {
+    SVSPubSub pubsub("/sync", "/late", face,
+                     [] (const std::vector<MissingDataInfo>&) {}, opts, securityOptions);
+    pubsub.addFetchForTest(publication,
+      {1, Name("/app"), [] (const SVSPubSub::SubscriptionData&) {}, false, false});
+    const auto payload = makePayload(8);
+    Data inner("/app/late");
+    inner.setContent(payload);
+    keyChain.sign(inner);
+    Data outer("/peer/sync/10/1");
+    outer.setContent(inner.wireEncode());
+    outer.setContentType(ndn::tlv::Data);
+    keyChain.sign(outer);
+    pubsub.onSyncData(outer, publication);
+  }
+  BOOST_CHECK_NO_THROW(lateValidator->succeed());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

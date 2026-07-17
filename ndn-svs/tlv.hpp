@@ -32,6 +32,8 @@ enum : uint32_t
   LzmaBlock = 211,
   BootstrapTime = 212,
   SeqNo = 214,
+  RepairData = 216,
+  RepairEntry = 217,
 };
 
 } // namespace ndn::svs::tlv

@@ -169,17 +169,22 @@ BOOST_AUTO_TEST_CASE(TrailingExtensionsAreBoundedAndCoreIndependent)
     keyChain.sign(data, security::signingWithSha256());
   };
 
-  const Block firstExtension(0xF001);
-  const Block secondExtension(0xF002);
+  const Block mapping(ndn::svs::tlv::MappingData);
+  const Block repair(ndn::svs::tlv::RepairData);
   auto interest = SyncProtocolCodec::encode("/ndn/svs-v3-test/extensions", vector,
-                                             {firstExtension, secondExtension},
+                                             {mapping, repair},
                                              SyncProtocolOptions().resolve(), signer);
   auto decoded = SyncProtocolCodec::decode(interest, "/ndn/svs-v3-test/extensions",
                                             SvsProtocolVersion::V3);
   BOOST_REQUIRE_EQUAL(decoded.extensions.size(), 2);
-  BOOST_CHECK_EQUAL(decoded.extensions.at(0).type(), 0xF001);
-  BOOST_CHECK_EQUAL(decoded.extensions.at(1).type(), 0xF002);
+  BOOST_CHECK_EQUAL(decoded.extensions.at(0).type(), ndn::svs::tlv::MappingData);
+  BOOST_CHECK_EQUAL(decoded.extensions.at(1).type(), ndn::svs::tlv::RepairData);
   BOOST_CHECK_EQUAL(decoded.stateVector.get("/node/a", 1700000000), 1);
+
+  BOOST_CHECK_THROW(SyncProtocolCodec::encode("/ndn/svs-v3-test/extensions", vector,
+                                               {mapping, mapping},
+                                               SyncProtocolOptions().resolve(), signer),
+                    SyncProtocolCodec::Error);
   std::vector<Block> tooMany(SyncProtocolCodec::MAX_EXTENSION_BLOCKS + 1,
                              Block(0xF001));
   BOOST_CHECK_THROW(SyncProtocolCodec::encode("/ndn/svs-v3-test/extensions", vector,

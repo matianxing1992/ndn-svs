@@ -52,11 +52,12 @@ makeSyncInterest(const Name& syncPrefix, const VersionVector& vv)
 }
 
 static Interest
-makeV3SyncInterest(const Name& syncPrefix, const VersionVector& vv)
+makeV3SyncInterest(const Name& syncPrefix, const VersionVector& vv,
+                   const std::vector<Block>& extensions = {})
 {
   KeyChain keyChain("pib-memory:core-v3-test", "tpm-memory:core-v3-test");
   return SyncProtocolCodec::encode(
-    syncPrefix, vv, {}, SyncProtocolOptions().resolve(),
+    syncPrefix, vv, extensions, SyncProtocolOptions().resolve(),
     [&] (Data& data) { keyChain.sign(data, security::signingWithSha256()); });
 }
 
@@ -593,6 +594,40 @@ BOOST_AUTO_TEST_CASE(V3ValidationPrecedesSemanticVectorDecode)
   BOOST_CHECK_EQUAL(rejects.signaturePolicy, 1);
   BOOST_CHECK_EQUAL(rejects.vectorDecode, 0);
   BOOST_CHECK_EQUAL(core.getState().get("/peer"), 0);
+}
+
+BOOST_AUTO_TEST_CASE(ExtensionCollectionIsDeliveredOnceAfterCoreMerge)
+{
+  for (const bool parallel : {false, true}) {
+    DummyClientFace localFace;
+    const Name group = parallel ? "/ndn/test/extensions-parallel" :
+                                  "/ndn/test/extensions-serial";
+    SVSyncCore core(localFace, group, [] (const auto&) {});
+    if (parallel) {
+      core.setParallelSyncProcessing(true, 1, 8);
+    }
+
+    size_t callbackCount = 0;
+    size_t extensionCount = 0;
+    bool coreMergedBeforeCallback = false;
+    core.setRecvExtraBlocksCallback(
+      [&] (const std::vector<Block>& extensions, const VersionVector&) {
+        ++callbackCount;
+        extensionCount = extensions.size();
+        coreMergedBeforeCallback = core.getState().get("/peer", 1700000000) == 1;
+      });
+
+    VersionVector remote;
+    remote.set("/peer", 1700000000, 1);
+    core.onSyncInterest(makeV3SyncInterest(
+      group, remote, {Block(ndn::svs::tlv::MappingData),
+                      Block(ndn::svs::tlv::RepairData)}));
+    runIoUntil(localFace, [&] { return callbackCount == 1; });
+
+    BOOST_CHECK_EQUAL(callbackCount, 1);
+    BOOST_CHECK_EQUAL(extensionCount, 2);
+    BOOST_CHECK(coreMergedBeforeCallback);
+  }
 }
 
 BOOST_AUTO_TEST_CASE(DeferredValidatorCallbackAfterShutdownIsFenced)

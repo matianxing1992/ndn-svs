@@ -23,7 +23,18 @@ Fetcher::Fetcher(Face& face, const SecurityOptions& securityOptions)
   : m_face(face)
   , m_scheduler(face.getIoContext())
   , m_securityOptions(securityOptions)
+  , m_alive(std::make_shared<std::atomic_bool>(true))
 {
+}
+
+Fetcher::~Fetcher()
+{
+  m_alive->store(false, std::memory_order_relaxed);
+  m_scheduler.cancelAllEvents();
+  m_pendingInterests.clear();
+  while (!m_interestQueue.empty()) {
+    m_interestQueue.pop();
+  }
 }
 
 void
@@ -69,10 +80,23 @@ Fetcher::processQueue()
     QueuedInterest i = m_interestQueue.front();
     m_interestQueue.pop();
 
+    auto alive = m_alive;
     m_pendingInterests[i.id] = m_face.expressInterest(i.interest,
-                                                      std::bind(&Fetcher::onData, this, _1, _2, i),
-                                                      std::bind(&Fetcher::onNack, this, _1, _2, i),
-                                                      std::bind(&Fetcher::onTimeout, this, _1, i));
+      [this, alive, i] (const Interest& interest, const Data& data) {
+        if (alive->load(std::memory_order_relaxed)) {
+          onData(interest, data, i);
+        }
+      },
+      [this, alive, i] (const Interest& interest, const lp::Nack& nack) {
+        if (alive->load(std::memory_order_relaxed)) {
+          onNack(interest, nack, i);
+        }
+      },
+      [this, alive, i] (const Interest& interest) {
+        if (alive->load(std::memory_order_relaxed)) {
+          onTimeout(interest, i);
+        }
+      });
   }
 }
 
@@ -86,18 +110,30 @@ Fetcher::onData(const Interest& interest, const Data& data, const QueuedInterest
     // No validator provided
     qi.afterSatisfied(interest, data);
   } else {
-    auto onDataValidated = [qi](const Data& data) { qi.afterSatisfied(qi.interest, data); };
+    auto alive = m_alive;
+    auto onDataValidated = [alive, qi](const Data& data) {
+      if (alive->load(std::memory_order_relaxed)) {
+        qi.afterSatisfied(qi.interest, data);
+      }
+    };
 
-    auto onValidationFailed = [this, qi](const Data& data, const ValidationError& error) {
+    auto onValidationFailed = [this, alive, qi](const Data& data, const ValidationError& error) {
+      if (!alive->load(std::memory_order_relaxed)) {
+        return;
+      }
       if (qi.nRetriesOnValidationFail > 0) {
         this->m_scheduler.schedule(
-          ndn::time::milliseconds(this->m_securityOptions.millisBeforeRetryOnValidationFail), [this, qi] {
+          ndn::time::milliseconds(this->m_securityOptions.millisBeforeRetryOnValidationFail),
+          [this, alive, qi] {
+            if (!alive->load(std::memory_order_relaxed)) {
+              return;
+            }
             QueuedInterest qiNew(qi);
             qiNew.nRetriesOnValidationFail--;
             this->expressInterest(qiNew);
           });
+        return;
       }
-      return;
 
       if (qi.afterValidationFailed) {
         qi.afterValidationFailed(data, error);
