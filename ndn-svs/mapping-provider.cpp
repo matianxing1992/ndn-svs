@@ -103,12 +103,14 @@ MappingProvider::MappingProvider(const Name& syncPrefix,
 void
 MappingProvider::insertMapping(const NodeID& nodeId, const SeqNo& seqNo, const MappingEntryPair& entry)
 {
+  std::lock_guard<std::mutex> lock(m_mapMutex);
   m_map[Name(nodeId).appendNumber(seqNo)] = entry;
 }
 
 MappingEntryPair
 MappingProvider::getMapping(const NodeID& nodeId, const SeqNo& seqNo)
 {
+  std::lock_guard<std::mutex> lock(m_mapMutex);
   return m_map.at(Name(nodeId).appendNumber(seqNo));
 }
 
