@@ -22,6 +22,16 @@ namespace ndn::tests {
 using namespace ndn::svs;
 using namespace std::chrono_literals;
 
+BOOST_AUTO_TEST_CASE(ExplicitV2ProfilePropagatesThroughPubSub)
+{
+  DummyClientFace face;
+  SVSPubSubOptions options;
+  options.syncProtocol.version = SvsProtocolVersion::V2;
+  SVSPubSub pubsub("/ndn/test/profile", "/node", face, [] (const auto&) {}, options);
+  BOOST_CHECK(pubsub.getSyncProtocolOptions().version == SvsProtocolVersion::V2);
+  BOOST_CHECK_EQUAL(pubsub.getSyncProtocolOptions().syncInterestLifetime, 1_ms);
+}
+
 static void
 runIoUntil(Face& face, const std::function<bool()>& done)
 {
@@ -89,9 +99,9 @@ BOOST_AUTO_TEST_CASE(LatePiggyDataSatisfiesPendingFetch)
     receivedSeq = data.seqNo;
   });
 
-  SeqNo seqNo = 7;
-  pubsub.insertMapping("/peer", seqNo, "/app/item", {});
-  BOOST_CHECK(pubsub.processMapping("/peer", seqNo));
+  BootstrapTime bootstrapTime = 100;
+  pubsub.insertMapping("/peer", bootstrapTime, 7, "/app/item", {});
+  BOOST_CHECK(pubsub.processMapping("/peer", bootstrapTime, 7));
   BOOST_CHECK_EQUAL(callbackCount, 0);
 
   Data piggyData("/app/item");
@@ -101,7 +111,7 @@ BOOST_AUTO_TEST_CASE(LatePiggyDataSatisfiesPendingFetch)
   keyChain.sign(piggyData);
 
   MappingList extra("/peer");
-  extra.pairs.push_back({seqNo, {Name("/app/item"), {}}});
+  extra.pairs.push_back({bootstrapTime, 7, {Name("/app/item"), {}}});
   Block params = extra.encode();
   params.push_back(piggyData.wireEncode());
   params.encode();
@@ -198,9 +208,9 @@ BOOST_AUTO_TEST_CASE(LatePiggyDataStillSatisfiesPendingFetch)
     receivedSeq = data.seqNo;
   });
 
-  SeqNo seqNo = 1;
-  pubsub.insertMapping("/peer", seqNo, "/app/item", {});
-  pubsub.processMapping("/peer", seqNo);
+  BootstrapTime bootstrapTime = 200;
+  pubsub.insertMapping("/peer", bootstrapTime, 1, "/app/item", {});
+  pubsub.processMapping("/peer", bootstrapTime, 1);
 
   Data piggyData("/app/item");
   const std::string body = "late";

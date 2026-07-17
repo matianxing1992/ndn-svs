@@ -32,6 +32,7 @@
 #include <queue>
 #include <atomic>
 #include <optional>
+#include <tuple>
 
 #include <boost/asio/thread_pool.hpp>
 
@@ -42,6 +43,9 @@ namespace ndn::svs {
  */
 struct SVSPubSubOptions
 {
+  /// @brief Sync wire protocol profile. Defaults to the V3 wire protocol.
+  SyncProtocolOptions syncProtocol;
+
   /// @brief Interface to store data packets
   std::shared_ptr<DataStore> dataStore = SVSync::DEFAULT_DATASTORE;
 
@@ -97,6 +101,12 @@ public:
             const SecurityOptions& securityOptions = SecurityOptions::DEFAULT);
 
   virtual ~SVSPubSub();
+
+  const ResolvedSyncProtocolOptions&
+  getSyncProtocolOptions() const noexcept
+  {
+    return m_svsync.getCore().getProtocolOptions();
+  }
 
   struct SubscriptionData
   {
@@ -254,7 +264,9 @@ NDN_SVS_PUBLIC_WITH_TESTS_ELSE_PRIVATE:
     std::shared_ptr<Regex> regex = make_shared<Regex>("^<>+$");
   };
 
-  void onSyncData(const Data& syncData, const std::pair<Name, SeqNo>& publication);
+  using PublicationKey = std::tuple<Name, BootstrapTime, SeqNo>;
+
+  void onSyncData(const Data& syncData, const PublicationKey& publication);
 
   void updateCallbackInternal(const std::vector<MissingDataInfo>& info);
 
@@ -266,24 +278,25 @@ NDN_SVS_PUBLIC_WITH_TESTS_ELSE_PRIVATE:
   satisfyPendingFetchFromPiggyData(const Data& data);
 
   bool
-  hasPiggyDeliveredPublication(const std::pair<Name, SeqNo>& publication);
+  hasPiggyDeliveredPublication(const PublicationKey& publication);
 
   void
-  rememberPiggyDeliveredPublication(const std::pair<Name, SeqNo>& publication);
+  rememberPiggyDeliveredPublication(const PublicationKey& publication);
 
   /// @brief Insert a mapping entry into the store
-  void insertMapping(const NodeID& nid, SeqNo seqNo, const Name& name, std::vector<Block> additional);
+  void insertMapping(const NodeID& nid, BootstrapTime bootstrapTime, SeqNo seqNo,
+                     const Name& name, std::vector<Block> additional);
 
   /**
    * @brief Get and process mapping from store.
    * @returns true if new publications were queued for fetch
    * @throws std::exception error if mapping is not found
    */
-  bool processMapping(const NodeID& nodeId, SeqNo seqNo);
+  bool processMapping(const NodeID& nodeId, BootstrapTime bootstrapTime, SeqNo seqNo);
 
   void fetchAll();
 
-  void cleanUpFetch(const std::pair<Name, SeqNo>& publication);
+  void cleanUpFetch(const PublicationKey& publication);
 
   SeqNo
   reserveSeqNo(const NodeID& nid);
@@ -298,6 +311,7 @@ NDN_SVS_PUBLIC_WITH_TESTS_ELSE_PRIVATE:
     };
 
     Kind kind = Kind::Bytes;
+    BootstrapTime bootstrapTime = 0;
     SeqNo seqNo = 0;
     Name name;
     Name nodePrefix;
@@ -310,6 +324,7 @@ NDN_SVS_PUBLIC_WITH_TESTS_ELSE_PRIVATE:
   struct PreparedPublication
   {
     SeqNo seqNo = 0;
+    BootstrapTime bootstrapTime = 0;
     Name nodePrefix;
     Name mappingName;
     time::milliseconds freshnessPeriod = FRESH_FOREVER;
@@ -380,8 +395,8 @@ private:
   std::vector<Subscription> m_regexSubscriptions;
 
   // Queue of publications to fetch
-  std::map<std::pair<Name, SeqNo>, std::vector<Subscription>> m_fetchMap;
-  std::map<std::pair<Name, SeqNo>, bool> m_fetchingMap;
+  std::map<PublicationKey, std::vector<Subscription>> m_fetchMap;
+  std::map<PublicationKey, bool> m_fetchingMap;
 
   size_t m_maxApplicationParametersSize;
   size_t m_maxPiggyDataSize;
@@ -394,8 +409,8 @@ private:
   std::map<Name, Data> m_piggyDataCache;
   std::deque<Name> m_piggyDataCacheOrder;
   size_t m_piggyDataCacheLimit;
-  std::map<std::pair<Name, SeqNo>, bool> m_piggyDeliveredPublications;
-  std::deque<std::pair<Name, SeqNo>> m_piggyDeliveredPublicationOrder;
+  std::map<PublicationKey, bool> m_piggyDeliveredPublications;
+  std::deque<PublicationKey> m_piggyDeliveredPublicationOrder;
   size_t m_piggyDeliveredPublicationLimit = 4096;
   std::mutex m_extraDataMutex;
 

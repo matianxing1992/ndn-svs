@@ -47,7 +47,8 @@ SVSPubSub::SVSPubSub(const Name& syncPrefix,
              face,
              std::bind(&SVSPubSub::updateCallbackInternal, this, _1),
              securityOptions,
-             options.dataStore)
+             options.dataStore,
+             options.syncProtocol)
   , m_mappingProvider(syncPrefix, nodePrefix, face, securityOptions)
   , m_maxApplicationParametersSize(std::max<size_t>(1, options.maxApplicationParametersSize))
   , m_maxPiggyDataSize(std::max<size_t>(1, options.maxPiggyDataSize))
@@ -82,6 +83,7 @@ SVSPubSub::publish(const Name& name,
 
     NodeID nid = nodePrefix == EMPTY_NAME ? m_dataPrefix : nodePrefix;
     SeqNo seqNo = reserveSeqNo(nid);
+    BootstrapTime bootstrapTime = m_svsync.getCore().getBootstrapTime();
 
     for (size_t i = 0; i < nSegments; i++) {
       // Create encapsulated segment
@@ -102,7 +104,7 @@ SVSPubSub::publish(const Name& name,
     }
 
     // Insert mapping and manually update the sequence number
-    insertMapping(nid, seqNo, name, mappingBlocks);
+    insertMapping(nid, bootstrapTime, seqNo, name, mappingBlocks);
     m_svsync.getCore().updateSeqNo(seqNo, nid);
     return seqNo;
   } else {
@@ -135,6 +137,7 @@ SVSPubSub::publishAsync(const Name& name, span<const uint8_t> value,
 
   AsyncPublication publication;
   publication.kind = AsyncPublication::Kind::Bytes;
+  publication.bootstrapTime = m_svsync.getCore().getBootstrapTime();
   publication.seqNo = seqNo;
   publication.name = name;
   publication.nodePrefix = nid;
@@ -155,9 +158,10 @@ SVSPubSub::publish(const Name& name,
   // Segment the data if larger than MAX_DATA_SIZE
   NodeID nid = nodePrefix == EMPTY_NAME ? m_dataPrefix : nodePrefix;
   SeqNo seqNo = reserveSeqNo(nid);
+  BootstrapTime bootstrapTime = m_svsync.getCore().getBootstrapTime();
 
   // Insert mapping and manually update the sequence number
-  insertMapping(nid, seqNo, name, mappingBlocks);
+  insertMapping(nid, bootstrapTime, seqNo, name, mappingBlocks);
   m_svsync.getCore().updateSeqNo(seqNo, nid);
 
   return seqNo;
@@ -173,6 +177,7 @@ SVSPubSub::publishAsync(const Name& name,
 
   AsyncPublication publication;
   publication.kind = AsyncPublication::Kind::NameOnly;
+  publication.bootstrapTime = m_svsync.getCore().getBootstrapTime();
   publication.seqNo = seqNo;
   publication.name = name;
   publication.nodePrefix = nid;
@@ -189,9 +194,10 @@ SVSPubSub::publishPacket(const Data& data, const Name& nodePrefix,
 {
   NodeID nid = nodePrefix == EMPTY_NAME ? m_dataPrefix : nodePrefix;
   SeqNo seqNo = reserveSeqNo(nid);
+  BootstrapTime bootstrapTime = m_svsync.getCore().getBootstrapTime();
   m_svsync.insertDataAtSeq(data.wireEncode(), data.getFreshnessPeriod(),
                            nid, seqNo, ndn::tlv::Data);
-  insertMapping(nid, seqNo, data.getName(), mappingBlocks);
+  insertMapping(nid, bootstrapTime, seqNo, data.getName(), mappingBlocks);
   m_svsync.getCore().updateSeqNo(seqNo, nid);
   return seqNo;
 }
@@ -205,6 +211,7 @@ SVSPubSub::publishPacketAsync(const Data& data, const Name& nodePrefix,
 
   AsyncPublication publication;
   publication.kind = AsyncPublication::Kind::Packet;
+  publication.bootstrapTime = m_svsync.getCore().getBootstrapTime();
   publication.seqNo = seqNo;
   publication.name = data.getName();
   publication.nodePrefix = nid;
@@ -281,6 +288,7 @@ SVSPubSub::prepareReservedBytes(const AsyncPublication& publication)
 {
   PreparedPublication prepared;
   prepared.seqNo = publication.seqNo;
+  prepared.bootstrapTime = publication.bootstrapTime;
   prepared.nodePrefix = publication.nodePrefix;
   prepared.mappingName = publication.name;
   prepared.freshnessPeriod = publication.freshnessPeriod;
@@ -307,7 +315,8 @@ SVSPubSub::prepareReservedBytes(const AsyncPublication& publication)
         m_securityOptions.dataSigner->sign(segment);
       }
 
-      Data outer(m_svsync.getDataName(publication.nodePrefix, publication.seqNo)
+      Data outer(m_svsync.getDataName(publication.nodePrefix, publication.bootstrapTime,
+                                      publication.seqNo)
                    .appendVersion(0).appendSegment(i));
       outer.setContent(segment.wireEncode());
       outer.setFreshnessPeriod(publication.freshnessPeriod);
@@ -322,7 +331,7 @@ SVSPubSub::prepareReservedBytes(const AsyncPublication& publication)
       prepared.outerPackets.push_back(std::move(outer));
     }
 
-    insertMapping(publication.nodePrefix, publication.seqNo,
+    insertMapping(publication.nodePrefix, publication.bootstrapTime, publication.seqNo,
                   publication.name, publication.mappingBlocks);
     return prepared;
   }
@@ -346,6 +355,7 @@ SVSPubSub::prepareReservedBytes(const AsyncPublication& publication)
 
   AsyncPublication packetPublication;
   packetPublication.kind = AsyncPublication::Kind::Packet;
+  packetPublication.bootstrapTime = publication.bootstrapTime;
   packetPublication.seqNo = publication.seqNo;
   packetPublication.name = data.getName();
   packetPublication.nodePrefix = publication.nodePrefix;
@@ -362,11 +372,12 @@ SVSPubSub::prepareReservedNameOnly(const AsyncPublication& publication)
 {
   PreparedPublication prepared;
   prepared.seqNo = publication.seqNo;
+  prepared.bootstrapTime = publication.bootstrapTime;
   prepared.nodePrefix = publication.nodePrefix;
   prepared.mappingName = publication.name;
   prepared.freshnessPeriod = publication.freshnessPeriod;
   prepared.mappingBlocks = publication.mappingBlocks;
-  insertMapping(publication.nodePrefix, publication.seqNo,
+  insertMapping(publication.nodePrefix, publication.bootstrapTime, publication.seqNo,
                 publication.name, publication.mappingBlocks);
   return prepared;
 }
@@ -376,13 +387,15 @@ SVSPubSub::prepareReservedPacket(const AsyncPublication& publication)
 {
   PreparedPublication prepared;
   prepared.seqNo = publication.seqNo;
+  prepared.bootstrapTime = publication.bootstrapTime;
   prepared.nodePrefix = publication.nodePrefix;
   prepared.mappingName = publication.packet.getName();
   prepared.freshnessPeriod = publication.packet.getFreshnessPeriod();
   prepared.mappingBlocks = publication.mappingBlocks;
   prepared.putFirstPacketToFace = true;
 
-  Data outer(m_svsync.getDataName(publication.nodePrefix, publication.seqNo));
+  Data outer(m_svsync.getDataName(publication.nodePrefix, publication.bootstrapTime,
+                                  publication.seqNo));
   outer.setContent(publication.packet.wireEncode());
   outer.setFreshnessPeriod(publication.packet.getFreshnessPeriod());
   outer.setContentType(ndn::tlv::Data);
@@ -393,7 +406,7 @@ SVSPubSub::prepareReservedPacket(const AsyncPublication& publication)
   outer.wireEncode();
   m_svsync.insertPreparedData(outer, false);
   prepared.outerPackets.push_back(std::move(outer));
-  insertMapping(publication.nodePrefix, publication.seqNo,
+  insertMapping(publication.nodePrefix, publication.bootstrapTime, publication.seqNo,
                 publication.packet.getName(), publication.mappingBlocks);
   return prepared;
 }
@@ -467,17 +480,15 @@ SVSPubSub::commitPreparedPublication(const PreparedPublication& publication)
 }
 
 void
-SVSPubSub::insertMapping(const NodeID& nid, SeqNo seqNo, const Name& name, std::vector<Block> additional)
+SVSPubSub::insertMapping(const NodeID& nid, BootstrapTime bootstrapTime, SeqNo seqNo,
+                         const Name& name, std::vector<Block> additional)
 {
   // additional is a copy deliberately
   // this way we can add well-known mappings to the list
 
   // add timestamp block
   if (m_opts.useTimestamp) {
-    unsigned long now = std::chrono::duration_cast<std::chrono::microseconds>(
-                          std::chrono::system_clock::now().time_since_epoch())
-                          .count();
-    auto timestamp = Name::Component::fromNumber(now, ndn::tlv::TimestampNameComponent);
+    auto timestamp = Name::Component::fromTimestamp(time::system_clock::now());
     additional.push_back(timestamp);
   }
 
@@ -489,12 +500,12 @@ SVSPubSub::insertMapping(const NodeID& nid, SeqNo seqNo, const Name& name, std::
     std::lock_guard<std::mutex> lock(m_extraDataMutex);
     if (m_notificationMappingList.nodeId == EMPTY_NAME || m_notificationMappingList.nodeId == nid) {
       m_notificationMappingList.nodeId = nid;
-      m_notificationMappingList.pairs.push_back({ seqNo, entry });
+      m_notificationMappingList.pairs.push_back({ bootstrapTime, seqNo, entry });
     }
   }
 
   // send mapping to provider
-  m_mappingProvider.insertMapping(nid, seqNo, entry);
+  m_mappingProvider.insertMapping(nid, bootstrapTime, seqNo, entry);
 }
 
 uint32_t
@@ -553,11 +564,12 @@ SVSPubSub::updateCallbackInternal(const std::vector<MissingDataInfo>& info)
       if (sub.prefix.isPrefixOf(streamName)) {
         // Add to fetching queue
         for (SeqNo i = stream.low; i <= stream.high; i++)
-          m_fetchMap[std::pair(stream.nodeId, i)].push_back(sub);
+          m_fetchMap[PublicationKey(stream.nodeId, stream.bootstrapTime, i)].push_back(sub);
 
         // Prefetch next available data
         if (sub.prefetch)
-          m_svsync.fetchData(stream.nodeId, stream.high + 1, [](auto&&...) {}); // do nothing with prefetch
+          m_svsync.fetchData(stream.nodeId, stream.bootstrapTime,
+                             stream.high + 1, [](auto&&...) {}); // do nothing with prefetch
       }
     }
 
@@ -571,7 +583,7 @@ SVSPubSub::updateCallbackInternal(const std::vector<MissingDataInfo>& info)
       for (SeqNo i = remainingInfo.low; i <= remainingInfo.high; i++) {
         try {
           // throws if mapping not found
-          this->processMapping(stream.nodeId, i);
+          this->processMapping(stream.nodeId, stream.bootstrapTime, i);
           remainingInfo.low++;
         } catch (const std::exception&) {
           break;
@@ -592,8 +604,8 @@ SVSPubSub::updateCallbackInternal(const std::vector<MissingDataInfo>& info)
           truncatedRemainingInfo,
           [this, remainingInfo, streamName](const MappingList& list) {
             bool queued = false;
-            for (const auto& [seq, mapping] : list.pairs)
-              queued |= this->processMapping(streamName, seq);
+            for (const auto& entry : list.pairs)
+              queued |= this->processMapping(streamName, entry.bootstrapTime, entry.seqNo);
 
             if (queued)
               this->fetchAll();
@@ -610,32 +622,27 @@ SVSPubSub::updateCallbackInternal(const std::vector<MissingDataInfo>& info)
 }
 
 bool
-SVSPubSub::processMapping(const NodeID& nodeId, SeqNo seqNo)
+SVSPubSub::processMapping(const NodeID& nodeId, BootstrapTime bootstrapTime, SeqNo seqNo)
 {
-  const std::pair<Name, SeqNo> publication(nodeId, seqNo);
+  const PublicationKey publication(nodeId, bootstrapTime, seqNo);
   if (hasPiggyDeliveredPublication(publication)) {
     return false;
   }
 
   // this will throw if mapping not found
-  auto mapping = m_mappingProvider.getMapping(nodeId, seqNo);
+  auto mapping = m_mappingProvider.getMapping(nodeId, bootstrapTime, seqNo);
 
   // check if timestamp is too old
   if (m_opts.maxPubAge > 0_ms) {
     // look for the additional timestamp block
     // if no timestamp block is present, we just skip this step
     for (const auto& block : mapping.second) {
-      if (block.type() != ndn::tlv::TimestampNameComponent)
+      Name::Component component(block);
+      if (!component.isTimestamp())
         continue;
 
-      unsigned long now = std::chrono::duration_cast<std::chrono::microseconds>(
-                            std::chrono::system_clock::now().time_since_epoch())
-                            .count();
-
-      unsigned long pubTime = Name::Component(block).toNumber();
-      unsigned long maxAge = time::microseconds(m_opts.maxPubAge).count();
-
-      if (now - pubTime > maxAge)
+      const auto pubTime = component.toTimestamp();
+      if (time::system_clock::now() - pubTime > m_opts.maxPubAge)
         return false;
     }
   }
@@ -723,9 +730,9 @@ SVSPubSub::fetchAll()
     m_fetchingMap[key] = true;
 
     // Fetch first data packet
-    const auto& [nodeId, seqNo] = key;
+    const auto& [nodeId, bootstrapTime, seqNo] = key;
     try {
-      const auto mapping = m_mappingProvider.getMapping(nodeId, seqNo);
+      const auto mapping = m_mappingProvider.getMapping(nodeId, bootstrapTime, seqNo);
       std::optional<Data> packet;
       {
         std::lock_guard<std::mutex> lock(m_extraDataMutex);
@@ -760,13 +767,17 @@ SVSPubSub::fetchAll()
     }
     catch (const std::exception&) {
     }
-    m_svsync.fetchData(nodeId, seqNo, std::bind(&SVSPubSub::onSyncData, this, _1, key), 12);
+    m_svsync.fetchData(nodeId, bootstrapTime, seqNo,
+                       std::bind(&SVSPubSub::onSyncData, this, _1, key), 12);
   }
 }
 
 void
-SVSPubSub::onSyncData(const Data& firstData, const std::pair<Name, SeqNo>& publication)
+SVSPubSub::onSyncData(const Data& firstData, const PublicationKey& publication)
 {
+  const auto& nodeId = std::get<0>(publication);
+  const auto seqNo = std::get<2>(publication);
+
   // Make sure the data is encapsulated
   if (firstData.getContentType() != ndn::tlv::Data) {
     m_fetchingMap[publication] = false;
@@ -779,7 +790,7 @@ SVSPubSub::onSyncData(const Data& firstData, const std::pair<Name, SeqNo>& publi
 
   // Return data to packet subscriptions
   SubscriptionData subData = {
-    innerData.getName(), innerContent.value_bytes(), publication.first, publication.second, innerData,
+    innerData.getName(), innerContent.value_bytes(), nodeId, seqNo, innerData,
   };
 
   // Function to return data to subscriptions
@@ -839,7 +850,8 @@ SVSPubSub::onSyncData(const Data& firstData, const std::pair<Name, SeqNo>& publi
 
               // Return data to packet subscriptions
               SubscriptionData subData = {
-                innerName, *finalBuffer, publication.first, publication.second, std::nullopt,
+                innerName, *finalBuffer, std::get<0>(publication), std::get<2>(publication),
+                std::nullopt,
               };
 
               for (const auto& sub : this->m_fetchMap[publication])
@@ -895,21 +907,21 @@ SVSPubSub::onSyncData(const Data& firstData, const std::pair<Name, SeqNo>& publi
 }
 
 void
-SVSPubSub::cleanUpFetch(const std::pair<Name, SeqNo>& publication)
+SVSPubSub::cleanUpFetch(const PublicationKey& publication)
 {
   m_fetchMap.erase(publication);
   m_fetchingMap.erase(publication);
 }
 
 bool
-SVSPubSub::hasPiggyDeliveredPublication(const std::pair<Name, SeqNo>& publication)
+SVSPubSub::hasPiggyDeliveredPublication(const PublicationKey& publication)
 {
   std::lock_guard<std::mutex> lock(m_extraDataMutex);
   return m_piggyDeliveredPublications.find(publication) != m_piggyDeliveredPublications.end();
 }
 
 void
-SVSPubSub::rememberPiggyDeliveredPublication(const std::pair<Name, SeqNo>& publication)
+SVSPubSub::rememberPiggyDeliveredPublication(const PublicationKey& publication)
 {
   std::lock_guard<std::mutex> lock(m_extraDataMutex);
   if (m_piggyDeliveredPublications.find(publication) == m_piggyDeliveredPublications.end()) {
@@ -926,13 +938,15 @@ SVSPubSub::rememberPiggyDeliveredPublication(const std::pair<Name, SeqNo>& publi
 bool
 SVSPubSub::satisfyPendingFetchFromPiggyData(const Data& data)
 {
-  std::vector<std::pair<std::pair<Name, SeqNo>, std::vector<Subscription>>> ready;
+  std::vector<std::pair<PublicationKey, std::vector<Subscription>>> ready;
 
   for (const auto& entry : m_fetchMap)
   {
     const auto& publication = entry.first;
     try {
-      auto mapping = m_mappingProvider.getMapping(publication.first, publication.second);
+      auto mapping = m_mappingProvider.getMapping(std::get<0>(publication),
+                                                  std::get<1>(publication),
+                                                  std::get<2>(publication));
       if (mapping.first == data.getName()) {
         ready.push_back(entry);
       }
@@ -947,8 +961,8 @@ SVSPubSub::satisfyPendingFetchFromPiggyData(const Data& data)
     SubscriptionData subData = {
       data.getName(),
       data.getContent().value_bytes(),
-      publication.first,
-      publication.second,
+      std::get<0>(publication),
+      std::get<2>(publication),
       packet,
     };
 
@@ -1033,14 +1047,14 @@ SVSPubSub::onGetExtraData(const VersionVector&)
 void
 SVSPubSub::onRecvExtraData(const Block& block, const VersionVector&)
 {
-  std::vector<std::pair<NodeID, SeqNo>> receivedMappings;
+  std::vector<PublicationKey> receivedMappings;
   try {
     NDN_LOG_TRACE("event=piggyback_recv_block type=" << block.type()
                   << " bytes=" << block.size());
     MappingList list(block);
-    for (const auto& p : list.pairs) {
-      m_mappingProvider.insertMapping(list.nodeId, p.first, p.second);
-      receivedMappings.emplace_back(list.nodeId, p.first);
+    for (const auto& entry : list.pairs) {
+      m_mappingProvider.insertMapping(list.nodeId, entry.bootstrapTime, entry.seqNo, entry.mapping);
+      receivedMappings.emplace_back(list.nodeId, entry.bootstrapTime, entry.seqNo);
     }
     NDN_LOG_TRACE("event=piggyback_recv_mapping_list node=" << list.nodeId
                   << " mappings=" << list.pairs.size());
@@ -1057,9 +1071,10 @@ SVSPubSub::onRecvExtraData(const Block& block, const VersionVector&)
                     << " bytes=" << childBlock.size());
       if (childBlock.type() == ndn::svs::tlv::MappingData) {
         MappingList childList(childBlock);
-        for (const auto& p : childList.pairs) {
-          m_mappingProvider.insertMapping(childList.nodeId, p.first, p.second);
-          receivedMappings.emplace_back(childList.nodeId, p.first);
+        for (const auto& entry : childList.pairs) {
+          m_mappingProvider.insertMapping(childList.nodeId, entry.bootstrapTime,
+                                          entry.seqNo, entry.mapping);
+          receivedMappings.emplace_back(childList.nodeId, entry.bootstrapTime, entry.seqNo);
         }
         mappingCount += childList.pairs.size();
       }
@@ -1097,9 +1112,9 @@ SVSPubSub::onRecvExtraData(const Block& block, const VersionVector&)
 
   bool queued = false;
   size_t processed = 0;
-  for (const auto& [nodeId, seqNo] : receivedMappings) {
+  for (const auto& [nodeId, bootstrapTime, seqNo] : receivedMappings) {
     try {
-      queued |= processMapping(nodeId, seqNo);
+      queued |= processMapping(nodeId, bootstrapTime, seqNo);
       ++processed;
     }
     catch (const std::exception&) {

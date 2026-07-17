@@ -19,6 +19,7 @@
 
 #include "common.hpp"
 #include "security-options.hpp"
+#include "sync-protocol.hpp"
 #include "version-vector.hpp"
 
 #include <ndn-cxx/util/random.hpp>
@@ -43,6 +44,8 @@ public:
   SeqNo high;
   /// @brief ndn::lp::IncomingFaceIdTag
   uint64_t incomingFace;
+  /// @brief bootstrap time identifying this node's current SVS session
+  BootstrapTime bootstrapTime = 0;
 };
 
 /**
@@ -59,6 +62,14 @@ using UpdateCallback = std::function<void(const std::vector<MissingDataInfo>&)>;
 class SVSyncCore : noncopyable
 {
 public:
+  enum class ValidationStatus : uint8_t
+  {
+    Never,
+    Verified,
+    StructuralUnverified,
+    Rejected,
+  };
+
   class Error : public std::runtime_error
   {
   public:
@@ -79,7 +90,8 @@ public:
              const Name& syncPrefix,
              const UpdateCallback& onUpdate,
              const SecurityOptions& securityOptions = SecurityOptions::DEFAULT,
-             const NodeID& nid = EMPTY_NODE_ID);
+             const NodeID& nid = EMPTY_NODE_ID,
+             const SyncProtocolOptions& protocolOptions = {});
 
   ~SVSyncCore();
 
@@ -102,6 +114,13 @@ public:
     uint64_t syncProductionWorkerQueueDepth = 0;
     uint64_t syncProductionWorkerProcessingMs = 0;
     uint64_t syncProductionParallelTotalMs = 0;
+  };
+
+  struct SyncRejectionStats
+  {
+    uint64_t malformedEnvelope = 0;
+    uint64_t signaturePolicy = 0;
+    uint64_t vectorDecode = 0;
   };
 
   void
@@ -151,6 +170,14 @@ public:
   SyncProcessingStats
   getSyncProcessingStats() const;
 
+  SyncRejectionStats
+  getSyncRejectionStats() const noexcept
+  {
+    return {m_malformedEnvelopeRejects.load(std::memory_order_relaxed),
+            m_signaturePolicyRejects.load(std::memory_order_relaxed),
+            m_vectorDecodeRejects.load(std::memory_order_relaxed)};
+  }
+
   /**
    * @brief Reset the sync tree (and restart synchronization again)
    *
@@ -179,6 +206,21 @@ public:
    */
   SeqNo getSeqNo(const NodeID& nid = EMPTY_NODE_ID) const;
 
+  BootstrapTime getBootstrapTime() const
+  {
+    return m_bootstrapTime;
+  }
+
+  const ResolvedSyncProtocolOptions& getProtocolOptions() const noexcept
+  {
+    return m_protocolOptions;
+  }
+
+  ValidationStatus getLastValidationStatus() const noexcept
+  {
+    return m_lastValidationStatus.load(std::memory_order_relaxed);
+  }
+
   /**
    * @brief Update the seqNo of the local session
    *
@@ -189,10 +231,13 @@ public:
    */
   void updateSeqNo(const SeqNo& seq, const NodeID& nid = EMPTY_NODE_ID);
 
+  void updateSeqNo(const SeqNo& seq, BootstrapTime bootstrapTime, const NodeID& nid);
+
   /// @brief Get all the nodeIDs
   std::set<NodeID> getNodeIds() const;
 
   using GetExtraBlockCallback = std::function<ndn::Block(const VersionVector&)>;
+  using GetExtraBlocksCallback = std::function<std::vector<ndn::Block>(const VersionVector&)>;
   using RecvExtraBlockCallback = std::function<void(const ndn::Block&, const VersionVector&)>;
 
   /**
@@ -204,6 +249,19 @@ public:
   void setGetExtraBlockCallback(const GetExtraBlockCallback& callback)
   {
     m_getExtraBlock = callback;
+    m_getExtraBlocks = nullptr;
+  }
+
+  /**
+   * @brief Install a bounded collection producer for trailing extension TLVs.
+   *
+   * This is the V3 extension API. The singular callback remains available for
+   * source compatibility and is adapted to a one-element collection.
+   */
+  void setGetExtraBlocksCallback(const GetExtraBlocksCallback& callback)
+  {
+    m_getExtraBlocks = callback;
+    m_getExtraBlock = nullptr;
   }
 
   /**
@@ -328,6 +386,12 @@ public:
   static inline const NodeID EMPTY_NODE_ID;
 
 private:
+  struct ValidationGate
+  {
+    std::mutex mutex;
+    SVSyncCore* owner = nullptr;
+  };
+
   struct SyncProcessingJob;
   struct SyncProcessingResult;
   struct SyncProductionJob;
@@ -352,8 +416,12 @@ private:
   // Communication
   ndn::Face& m_face;
   const Name m_syncPrefix;
+  const Name m_syncInterestPrefix;
   const SecurityOptions m_securityOptions;
+  const ResolvedSyncProtocolOptions m_protocolOptions;
   const NodeID m_id;
+  const BootstrapTime m_bootstrapTime;
+  ndn::ScopedInterestFilterHandle m_syncInterestFilter;
   ndn::ScopedRegisteredPrefixHandle m_syncRegisteredPrefix;
 
   const UpdateCallback m_onUpdate;
@@ -368,6 +436,7 @@ private:
 
   // Extra block
   GetExtraBlockCallback m_getExtraBlock;
+  GetExtraBlocksCallback m_getExtraBlocks;
   RecvExtraBlockCallback m_recvExtraBlock;
 
   // Max suppression time; this value is roughly
@@ -406,6 +475,11 @@ private:
   time::milliseconds m_syncInterestBatchWindow = 5_ms;
 
   std::atomic<bool> m_parallelSyncProcessing{false};
+  std::shared_ptr<ValidationGate> m_validationGate = std::make_shared<ValidationGate>();
+  std::atomic<ValidationStatus> m_lastValidationStatus{ValidationStatus::Never};
+  std::atomic<uint64_t> m_malformedEnvelopeRejects{0};
+  std::atomic<uint64_t> m_signaturePolicyRejects{0};
+  std::atomic<uint64_t> m_vectorDecodeRejects{0};
   std::shared_ptr<std::atomic<bool>> m_syncProcessingAlive;
   std::unique_ptr<SyncWorkerPool> m_syncWorkerPool;
   std::atomic<uint64_t> m_syncJobsSubmitted{0};
