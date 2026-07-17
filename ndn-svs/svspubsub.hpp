@@ -25,6 +25,9 @@
 
 #include <ndn-cxx/security/validator-null.hpp>
 #include <ndn-cxx/util/regex.hpp>
+#include <ndn-cxx/ims/in-memory-storage-fifo.hpp>
+
+#include <queue>
 
 namespace ndn::svs {
 
@@ -50,6 +53,15 @@ struct SVSPubSubOptions
    * The useTimestamp option should be enabled for this to work.
    */
   time::milliseconds maxPubAge = 0_ms;
+
+  /** @brief Maximum encoded size of extra blocks carried in Sync Interest parameters. */
+  size_t maxApplicationParametersSize = 4096;
+
+  /** @brief Maximum encoded Data size eligible for Sync Interest piggybacking. */
+  size_t maxPiggyDataSize = 800;
+
+  /** @brief Maximum number of received piggyback Data packets retained in memory. */
+  size_t piggyDataCacheLimit = 1024;
 };
 
 /**
@@ -198,7 +210,7 @@ public:
     return m_svsync;
   }
 
-private:
+NDN_SVS_PUBLIC_WITH_TESTS_ELSE_PRIVATE:
   struct Subscription
   {
     uint32_t id;
@@ -216,7 +228,16 @@ private:
 
   Block onGetExtraData(const VersionVector& vv);
 
-  void onRecvExtraData(const Block& block);
+  void onRecvExtraData(const Block& block, const VersionVector& vv);
+
+  bool
+  satisfyPendingFetchFromPiggyData(const Data& data);
+
+  bool
+  hasPiggyDeliveredPublication(const std::pair<Name, SeqNo>& publication);
+
+  void
+  rememberPiggyDeliveredPublication(const std::pair<Name, SeqNo>& publication);
 
   /// @brief Insert a mapping entry into the store
   void insertMapping(const NodeID& nid, SeqNo seqNo, const Name& name, std::vector<Block> additional);
@@ -231,6 +252,12 @@ private:
   void fetchAll();
 
   void cleanUpFetch(const std::pair<Name, SeqNo>& publication);
+
+  struct PiggyDataEntry
+  {
+    Data data;
+    size_t missed = 0;
+  };
 
 public:
   static inline const Name EMPTY_NAME;
@@ -264,6 +291,20 @@ private:
   // Queue of publications to fetch
   std::map<std::pair<Name, SeqNo>, std::vector<Subscription>> m_fetchMap;
   std::map<std::pair<Name, SeqNo>, bool> m_fetchingMap;
+
+  size_t m_maxApplicationParametersSize;
+  size_t m_maxPiggyDataSize;
+  // Pending piggyback Data. Newer entries are tried first; entries that miss
+  // several Sync Interest opportunities are dropped and peers fetch normally.
+  std::deque<PiggyDataEntry> m_piggyDataQueue;
+  // A bounded cache for received piggyback Data.
+  std::map<Name, Data> m_piggyDataCache;
+  std::deque<Name> m_piggyDataCacheOrder;
+  size_t m_piggyDataCacheLimit;
+  std::map<std::pair<Name, SeqNo>, bool> m_piggyDeliveredPublications;
+  std::deque<std::pair<Name, SeqNo>> m_piggyDeliveredPublicationOrder;
+  size_t m_piggyDeliveredPublicationLimit = 4096;
+  std::mutex m_extraDataMutex;
 };
 
 } // namespace ndn::svs
