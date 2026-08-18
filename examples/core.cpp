@@ -26,6 +26,7 @@ struct Options
 {
   std::string prefix;
   std::string m_id;
+  std::string protocol = "v3";
 };
 
 class Program
@@ -37,15 +38,20 @@ public:
     // This is a usage example of the low level SvSyncCore API.
 
     // Create the SVSyncCore instance
+    ndn::svs::SyncProtocolOptions protocol;
+    protocol.version = m_options.protocol == "v2" ? ndn::svs::SvsProtocolVersion::V2 :
+                                                    ndn::svs::SvsProtocolVersion::V3;
     m_svs = std::make_shared<ndn::svs::SVSyncCore>(
       face,                                    // Shared NDN face
       ndn::Name(m_options.prefix),             // Sync prefix, common for all nodes in the group
       std::bind(&Program::onUpdate, this, _1), // Callback on learning new sequence numbers from SVS
       ndn::svs::SecurityOptions::DEFAULT,      // Security configuration
-      ndn::Name(m_options.m_id)                // Unique prefix for this node
+      ndn::Name(m_options.m_id),               // Unique prefix for this node
+      protocol                                 // Complete V3 (default) or explicit legacy V2
     );
 
-    std::cout << "SVS client starting: " << m_options.m_id << std::endl;
+    std::cout << "SVS client starting: " << m_options.m_id
+              << " protocol=" << m_options.protocol << std::endl;
   }
 
   void run()
@@ -88,14 +94,18 @@ public:
 int
 main(int argc, char** argv)
 {
-  if (argc != 2) {
-    std::cerr << "Usage: " << argv[0] << " <prefix>" << std::endl;
+  if (argc < 2 || argc > 3 || (argc == 3 && std::string_view(argv[2]) != "v2" &&
+                               std::string_view(argv[2]) != "v3")) {
+    std::cerr << "Usage: " << argv[0] << " <node-prefix> [v2|v3]" << std::endl;
     return 1;
   }
 
   Options opt;
   opt.prefix = "/ndn/svs";
   opt.m_id = argv[1];
+  if (argc == 3) {
+    opt.protocol = argv[2];
+  }
 
   Program program(opt);
   program.run();
