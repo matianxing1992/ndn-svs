@@ -929,6 +929,61 @@ BOOST_AUTO_TEST_CASE(UnsubscribedCatchUpDoesNotReceivePendingPublication)
   BOOST_CHECK_EQUAL(cancelledCalls, 0);
 }
 
+BOOST_AUTO_TEST_CASE(ExplicitV2PubSubProducesAndConsumesV2Mappings)
+{
+  DummyClientFace producerFace;
+  DummyClientFace consumerFace;
+  SVSPubSubOptions opts;
+  opts.useTimestamp = false;
+  opts.syncProtocol.version = SvsProtocolVersion::V2;
+  SVSPubSub producer("/sync", "/producer", producerFace, [] (const auto&) {}, opts);
+  SVSPubSub consumer("/sync", "/consumer", consumerFace, [] (const auto&) {}, opts);
+  std::set<Name> observed;
+  consumer.subscribeWithRegex(Regex("^<app><>*$"),
+    [&] (const auto& item) { observed.insert(item.name); }, false);
+
+  producer.publish(Name("/app/v2-mapping"), Name("/producer"));
+  const auto extensions = producer.onGetExtraBlocks(VersionVector());
+  BOOST_REQUIRE(!extensions.empty());
+  for (const auto& extension : extensions) {
+    if (extension.type() == ndn::svs::tlv::MappingData) {
+      BOOST_CHECK_NO_THROW(MappingList(extension, SvsProtocolVersion::V2));
+    }
+  }
+  consumer.onRecvExtraBlocks(extensions, VersionVector());
+  BOOST_CHECK_EQUAL(observed.count(Name("/app/v2-mapping")), 1);
+}
+
+BOOST_AUTO_TEST_CASE(ExplicitV2PubSubFetchesMappingUsingV2Query)
+{
+  DummyClientFace face;
+  SVSPubSubOptions opts;
+  opts.useTimestamp = false;
+  opts.syncProtocol.version = SvsProtocolVersion::V2;
+  SVSPubSub consumer("/sync", "/consumer", face, [] (const auto&) {}, opts);
+  runIoFor(face, 20_ms);
+  face.sentInterests.clear();
+  std::set<Name> observed;
+  consumer.subscribeWithRegex(Regex("^<app><>*$"),
+    [&] (const auto& item) { observed.insert(item.name); }, false);
+  consumer.updateCallbackInternal({MissingDataInfo{"/peer", 1, 1, 0, 0}});
+  runIoUntil(face, [&] { return !face.sentInterests.empty(); });
+  BOOST_REQUIRE(!face.sentInterests.empty());
+  const auto expected = Name("/peer/sync/MAPPING").appendNumber(1).appendNumber(1);
+  BOOST_REQUIRE_EQUAL(face.sentInterests.front().getName(), expected);
+
+  MappingList mapping("/peer", SvsProtocolVersion::V2);
+  mapping.pairs.push_back({0, 1, {Name("/app/v2-fetched"), {}}});
+  KeyChain keys("pib-memory:v2-pubsub-mapping", "tpm-memory:v2-pubsub-mapping");
+  keys.createIdentity("/test/v2-pubsub-mapping");
+  Data response(expected);
+  response.setContent(mapping.encode());
+  keys.sign(response);
+  face.receive(response);
+  runIoUntil(face, [&] { return observed.count(Name("/app/v2-fetched")) == 1; });
+  BOOST_CHECK_EQUAL(observed.count(Name("/app/v2-fetched")), 1);
+}
+
 BOOST_AUTO_TEST_CASE(SmallDataIsPiggybackedAcrossMultipleRounds)
 {
   DummyClientFace face;
@@ -1094,9 +1149,9 @@ BOOST_AUTO_TEST_CASE(KnownExtensionCollectionPrepareCommitIsAtomic)
 
 BOOST_AUTO_TEST_CASE(SegmentedPublicationFitsFinalSignedOuterBoundary)
 {
-  KeyChain boundaryKeyChain("pib-memory:svspubsub-outer-boundary",
-                            "tpm-memory:svspubsub-outer-boundary");
-  boundaryKeyChain.createIdentity("/svspubsub-test/outer-boundary");
+  KeyChain boundaryKeyChain("pib-memory:spec113-outer-boundary",
+                            "tpm-memory:spec113-outer-boundary");
+  boundaryKeyChain.createIdentity("/spec113/outer-boundary");
   const auto below = makeSignedOuterPacketOfSize(boundaryKeyChain,
                                                   MAX_NDN_PACKET_SIZE - 1);
   const auto exact = makeSignedOuterPacketOfSize(boundaryKeyChain,
@@ -1114,8 +1169,8 @@ BOOST_AUTO_TEST_CASE(SegmentedPublicationFitsFinalSignedOuterBoundary)
          Name("/short"),
          Name("/a/very/long/application/name/whose/components/exercise/the/final/wire/budget")}) {
     DummyClientFace face;
-    KeyChain keyChain("pib-memory:svspubsub-boundary", "tpm-memory:svspubsub-boundary");
-    keyChain.createIdentity("/svspubsub-test/a/long/certificate/identity/for/segment/signing");
+    KeyChain keyChain("pib-memory:spec112-boundary", "tpm-memory:spec112-boundary");
+    keyChain.createIdentity("/spec112/a/long/certificate/identity/for/segment/signing");
     SecurityOptions securityOptions(keyChain);
     auto store = std::make_shared<ThrowingDataStore>();
     SVSPubSubOptions opts;
@@ -1150,9 +1205,8 @@ BOOST_AUTO_TEST_CASE(SegmentedPublicationFitsFinalSignedOuterBoundary)
 BOOST_AUTO_TEST_CASE(FailedSegmentPreparationDoesNotAdvanceVisibleSequence)
 {
   DummyClientFace face;
-  KeyChain keyChain("pib-memory:svspubsub-sign-failure",
-                    "tpm-memory:svspubsub-sign-failure");
-  keyChain.createIdentity("/svspubsub-test/signer");
+  KeyChain keyChain("pib-memory:spec112-sign-failure", "tpm-memory:spec112-sign-failure");
+  keyChain.createIdentity("/spec112/signer");
   SecurityOptions securityOptions(keyChain);
   auto signer = std::make_shared<ThrowingDataSigner>(keyChain);
   signer->failAt(3);
@@ -1395,8 +1449,8 @@ BOOST_AUTO_TEST_CASE(ShutdownRollsBackStoredButUnadvertisedPublication)
 
 BOOST_AUTO_TEST_CASE(InnerSegmentAssemblyRejectsMissingMalformedAndDuplicateSegments)
 {
-  KeyChain keyChain("pib-memory:svspubsub-assembly", "tpm-memory:svspubsub-assembly");
-  keyChain.createIdentity("/svspubsub-test/assembly");
+  KeyChain keyChain("pib-memory:spec112-assembly", "tpm-memory:spec112-assembly");
+  keyChain.createIdentity("/spec112/assembly");
   const auto first = makePayload(4);
   const auto second = makePayload(5);
   const auto third = makePayload(6);
@@ -1418,9 +1472,8 @@ BOOST_AUTO_TEST_CASE(InnerSegmentAssemblyRejectsMissingMalformedAndDuplicateSegm
 BOOST_AUTO_TEST_CASE(ValidationFailureAndLateCallbackReclaimFetchStateSafely)
 {
   DummyClientFace face;
-  KeyChain keyChain("pib-memory:svspubsub-validation",
-                    "tpm-memory:svspubsub-validation");
-  keyChain.createIdentity("/svspubsub-test/validation");
+  KeyChain keyChain("pib-memory:spec112-validation", "tpm-memory:spec112-validation");
+  keyChain.createIdentity("/spec112/validation");
   SecurityOptions securityOptions(keyChain);
   auto validator = std::make_shared<DeferredValidator>();
   securityOptions.encapsulatedDataValidator = validator;

@@ -27,7 +27,7 @@ namespace ndn::svs {
  * @brief SVSync using shared prefix for data delivery
  *
  * Sync core runs under <grp-prefix>/s/
- * Data is produced as <grp-prefix>/d/<node-id>/<seq>
+ * V3 Data is produced as <grp-prefix>/d/<node-id>/<bootstrap-time>/<seq>
  * Both prefixes use multicast strategy, so all nodes receive
  * data interests for all other nodes.
  */
@@ -62,10 +62,12 @@ private:
   Name makeDataName(const NodeID& nid, const BootstrapTime& bootstrapTime,
                     const SeqNo& seqNo) override
   {
-    return Name(m_dataPrefix).append(nid)
-                             .append(Name::Component::fromTimestamp(
-                               time::fromUnixTimestamp(time::seconds(bootstrapTime))))
-                             .append(Name::Component::fromSequenceNumber(seqNo));
+    Name name = Name(m_dataPrefix).append(nid);
+    if (getCore().getProtocolOptions().version == SvsProtocolVersion::V3) {
+      name.append(Name::Component::fromTimestamp(
+        time::fromUnixTimestamp(time::seconds(bootstrapTime))));
+    }
+    return name.append(Name::Component::fromSequenceNumber(seqNo));
   }
 
   bool shouldCache(const Data&) const override

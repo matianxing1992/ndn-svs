@@ -148,7 +148,8 @@ SVSPubSub::SVSPubSub(const Name& syncPrefix,
              securityOptions,
              options.dataStore,
              options.syncProtocol)
-  , m_mappingProvider(syncPrefix, nodePrefix, face, securityOptions)
+  , m_mappingProvider(syncPrefix, nodePrefix, face, securityOptions,
+                       options.syncProtocol.version)
   , m_maxApplicationParametersSize(std::max<size_t>(1, options.maxApplicationParametersSize))
   , m_maxPiggyDataSize(std::max<size_t>(1, options.maxPiggyDataSize))
   , m_piggyDataCacheLimit(std::max<size_t>(1, options.piggyDataCacheLimit))
@@ -2044,7 +2045,7 @@ SVSPubSub::onGetExtraData(const VersionVector&)
   std::lock_guard<std::mutex> lock(m_extraDataMutex);
   const auto lockedAt = SteadyClock::now();
 
-  MappingList includedMappings(m_notificationMappingList.nodeId);
+  MappingList includedMappings(m_notificationMappingList.nodeId, m_opts.syncProtocol.version);
   size_t mappingCount = 0;
   size_t repeatedMappingCount = 0;
   size_t piggyCount = 0;
@@ -2079,7 +2080,7 @@ SVSPubSub::onGetExtraData(const VersionVector&)
   std::deque<PiggyMappingEntry> retainedMappings;
   const auto repeatedMappingStart = SteadyClock::now();
   for (auto it = m_piggyMappingQueue.rbegin(); it != m_piggyMappingQueue.rend(); ++it) {
-    MappingList repairMapping(it->nodeId);
+    MappingList repairMapping(it->nodeId, m_opts.syncProtocol.version);
     repairMapping.pairs.push_back(it->mapping);
     auto mappingBlock = repairMapping.encode();
     if (size + mappingBlock.size() > m_maxApplicationParametersSize) {
@@ -2197,7 +2198,7 @@ SVSPubSub::onGetExtraData(const VersionVector&)
                 << " final_encode_us=" << elapsedUs(finalEncodeStart, finalEncodeDone)
                 << " total_us=" << elapsedUs(totalStart, finalEncodeDone));
 
-  m_notificationMappingList = MappingList();
+  m_notificationMappingList = MappingList(m_opts.syncProtocol.version);
 
   return block;
 }
@@ -2246,14 +2247,14 @@ SVSPubSub::onRecvExtraBlocks(const std::vector<Block>& blocks, const VersionVect
       }
       block.parse();
       if (block.type() == tlv::MappingData) {
-        static_cast<void>(MappingList(block));
+        static_cast<void>(MappingList(block, m_opts.syncProtocol.version));
       }
       else {
         static_cast<void>(decodeRepairRequests(block));
       }
       for (const auto& child : block.elements()) {
         if (child.type() == tlv::MappingData) {
-          static_cast<void>(MappingList(child));
+          static_cast<void>(MappingList(child, m_opts.syncProtocol.version));
         }
         else if (child.type() == ndn::tlv::Data) {
           static_cast<void>(Data(child));
@@ -2290,14 +2291,14 @@ SVSPubSub::onRecvExtraData(const Block& block, const VersionVector&)
     }
     block.parse();
     if (block.type() == tlv::MappingData) {
-      static_cast<void>(MappingList(block));
+      static_cast<void>(MappingList(block, m_opts.syncProtocol.version));
     }
     else {
       static_cast<void>(decodeRepairRequests(block));
     }
     for (const auto& child : block.elements()) {
       if (child.type() == tlv::MappingData) {
-        static_cast<void>(MappingList(child));
+        static_cast<void>(MappingList(child, m_opts.syncProtocol.version));
       }
       else if (child.type() == ndn::tlv::Data) {
         static_cast<void>(Data(child));
@@ -2317,7 +2318,7 @@ SVSPubSub::onRecvExtraData(const Block& block, const VersionVector&)
     NDN_LOG_TRACE("event=piggyback_recv_block type=" << block.type()
                   << " bytes=" << block.size());
     const auto parseStart = SteadyClock::now();
-    MappingList list(block);
+    MappingList list(block, m_opts.syncProtocol.version);
     for (const auto& entry : list.pairs) {
       m_mappingProvider.insertMapping(list.nodeId, entry.bootstrapTime, entry.seqNo, entry.mapping);
       receivedMappings.emplace_back(list.nodeId, entry.bootstrapTime, entry.seqNo);
@@ -2355,7 +2356,7 @@ SVSPubSub::onRecvExtraData(const Block& block, const VersionVector&)
                     << " bytes=" << childBlock.size());
       if (childBlock.type() == ndn::svs::tlv::MappingData) {
         const auto childMappingStart = SteadyClock::now();
-        MappingList childList(childBlock);
+        MappingList childList(childBlock, m_opts.syncProtocol.version);
         for (const auto& entry : childList.pairs) {
           m_mappingProvider.insertMapping(childList.nodeId, entry.bootstrapTime,
                                           entry.seqNo, entry.mapping);

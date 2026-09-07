@@ -74,9 +74,10 @@ def digest_signed_data(data_name: str, content: bytes, *, corrupt=False, omit_si
 
 
 def params(data_name: str, state: bytes, *, corrupt=False, omit_signature=False,
-           trailing: bytes = b"") -> bytes:
-    data = digest_signed_data(data_name, state, corrupt=corrupt, omit_signature=omit_signature)
-    return tlv(36, data + trailing)
+           signed_extensions: bytes = b"", unsigned_trailing: bytes = b"") -> bytes:
+    data = digest_signed_data(data_name, state + signed_extensions,
+                              corrupt=corrupt, omit_signature=omit_signature)
+    return tlv(36, data + unsigned_trailing)
 
 
 def write(path: Path, wire: bytes) -> None:
@@ -98,7 +99,8 @@ def main() -> None:
     write(ROOT / "v3-empty.hex", params(group, empty))
     write(ROOT / "v3-one-node.hex", params(group, one))
     write(ROOT / "v3-multi-epoch.hex", params(group, multi))
-    write(ROOT / "v3-unknown-extension.hex", params(group, one, trailing=tlv(0xF001, b"opaque")))
+    write(ROOT / "v3-unknown-extension.hex",
+          params(group, one, signed_extensions=tlv(0xF001, b"opaque")))
 
     write(INVALID / "wrong-data-name.hex", params("/ndn/svs-v3-test/v=2", one))
     write(INVALID / "missing-signature.hex", params(group, one, omit_signature=True))
@@ -109,7 +111,10 @@ def main() -> None:
     write(INVALID / "future-bootstrap.hex", params(group, vector([("/node/a", [(4102444800, 1)])])))
     write(INVALID / "duplicate-state-vector.hex", tlv(36, digest_signed_data(group, one + one)))
     write(INVALID / "unknown-core-tlv.hex", params(group, vector([], extra=tlv(0xF000, b"unknown"))))
-    write(INVALID / "truncated-extension.hex", params(group, one) + varnum(205) + varnum(8) + b"abc")
+    write(INVALID / "truncated-extension.hex",
+          params(group, one, signed_extensions=varnum(0xF001) + varnum(8) + b"abc"))
+    write(INVALID / "unsigned-trailing-extension.hex",
+          params(group, one, unsigned_trailing=tlv(0xF001, b"opaque")))
 
 
 if __name__ == "__main__":

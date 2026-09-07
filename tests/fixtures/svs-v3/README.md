@@ -11,14 +11,16 @@ The normative fields come from the SVS V3 specification dated 2025-01-14.
   bootstrap epoch or SeqNoEntry wrapper.
 - `v3-empty.hex`, `v3-one-node.hex`, `v3-multi-epoch.hex`: complete
   ApplicationParameters containing a signed Data named `/ndn/svs-v3-test/v=3`.
-- the Data Content is exactly one StateVector TLV.
+- the Data Content starts with one StateVector TLV; optional extensions follow
+  inside the same signed Content.
 - deterministic fixtures use DigestSha256 signature type 0. Production trust
   policy tests separately use the configured KeyChain signer/validator.
-- `v3-unknown-extension.hex` carries one unknown non-critical trailing block;
+- `v3-unknown-extension.hex` carries one unknown non-critical signed extension;
   core-only V3 decoding must ignore it.
 - `invalid/` contains one isolated violation per file, except
-  `truncated-extension.hex`, which deliberately cannot form a complete
-  ApplicationParameters element.
+  `truncated-extension.hex`, which deliberately contains an incomplete
+  extension inside signed Content. `unsigned-trailing-extension.hex` checks
+  that an extension outside the signed State Vector Data is rejected.
 
 The fixed timestamps are historical except `4102444800` (2100-01-01), used as
 a stable future-time rejection vector. Sequence numbers in valid encoded

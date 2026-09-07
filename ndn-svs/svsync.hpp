@@ -28,7 +28,7 @@ namespace ndn::svs {
  *
  * The data prefix acts as the node ID in the version vector
  * Sync core runs under <sync-prefix>
- * Data is produced as <data-prefix>/<sync-prefix>/<seq>
+ * V3 Data is produced as <data-prefix>/<sync-prefix>/<bootstrap-time>/<seq>
  */
 class SVSync : public SVSyncBase
 {
@@ -55,10 +55,12 @@ private:
   Name makeDataName(const NodeID& nid, const BootstrapTime& bootstrapTime,
                     const SeqNo& seqNo) override
   {
-    return Name(nid).append(m_syncPrefix)
-                    .append(Name::Component::fromTimestamp(
-                      time::fromUnixTimestamp(time::seconds(bootstrapTime))))
-                    .append(Name::Component::fromSequenceNumber(seqNo));
+    Name name = Name(nid).append(m_syncPrefix);
+    if (getCore().getProtocolOptions().version == SvsProtocolVersion::V3) {
+      name.append(Name::Component::fromTimestamp(
+        time::fromUnixTimestamp(time::seconds(bootstrapTime))));
+    }
+    return name.append(Name::Component::fromSequenceNumber(seqNo));
   }
 };
 

@@ -46,7 +46,7 @@ namespace ndn::svs {
  */
 struct SVSPubSubOptions
 {
-  /// @brief Sync wire protocol profile. Defaults to the V3 wire protocol.
+  /// @brief Sync wire protocol profile. Experimental defaults to complete V3.
   SyncProtocolOptions syncProtocol;
 
   /// @brief Interface to store data packets

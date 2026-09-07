@@ -40,12 +40,14 @@ struct MappingEntry
 class MappingList
 {
 public:
-  MappingList();
+  explicit MappingList(SvsProtocolVersion version = SvsProtocolVersion::V3);
 
-  explicit MappingList(const NodeID& nid);
+  explicit MappingList(const NodeID& nid,
+                       SvsProtocolVersion version = SvsProtocolVersion::V3);
 
   /// @brief Decode from Block
-  explicit MappingList(const Block& block);
+  explicit MappingList(const Block& block,
+                       SvsProtocolVersion version = SvsProtocolVersion::V3);
 
   /// @brief Encode to Block
   Block encode() const;
@@ -53,6 +55,9 @@ public:
 public:
   NodeID nodeId;
   std::vector<MappingEntry> pairs;
+
+private:
+  SvsProtocolVersion m_version;
 };
 
 /**
@@ -64,7 +69,8 @@ public:
   MappingProvider(const Name& syncPrefix,
                   const NodeID& id,
                   ndn::Face& face,
-                  const SecurityOptions& securityOptions);
+                  const SecurityOptions& securityOptions,
+                  SvsProtocolVersion protocolVersion = SvsProtocolVersion::V3);
 
   virtual ~MappingProvider() = default;
 
@@ -118,7 +124,7 @@ public:
     return m_fetcher.getStats();
   }
 
-private:
+NDN_SVS_PUBLIC_WITH_TESTS_ELSE_PRIVATE:
   /**
    * @brief Return data name for mapping query
    */
@@ -137,8 +143,9 @@ private:
   Face& m_face;
   Fetcher m_fetcher;
   const SecurityOptions m_securityOptions;
+  const SvsProtocolVersion m_protocolVersion;
 
-  ndn::ScopedRegisteredPrefixHandle m_registeredPrefix;
+  ndn::ScopedInterestFilterHandle m_interestFilter;
 
   std::map<Name, MappingEntryPair> m_map;
   std::mutex m_mapMutex;

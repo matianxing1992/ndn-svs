@@ -3,6 +3,7 @@
 
 #include <cmath>
 #include <chrono>
+#include <iterator>
 #include <set>
 
 #ifdef NDN_SVS_COMPRESSION
@@ -83,13 +84,15 @@ SyncProtocolCodec::encode(const Name& groupPrefix,
   ndn::encoding::EncodingBuffer encoder;
   size_t length = 0;
 
-  for (auto it = extensions.rbegin(); it != extensions.rend(); ++it) {
-    length += ndn::encoding::prependBlock(encoder, *it);
-  }
-
   if (options.version == SvsProtocolVersion::V3) {
     Data stateData(syncName);
-    stateData.setContent(stateVector.encode());
+    Block content(ndn::tlv::Content);
+    content.push_back(stateVector.encode());
+    for (const auto& extension : extensions) {
+      content.push_back(extension);
+    }
+    content.encode();
+    stateData.setContent(content);
     if (!signData) {
       NDN_THROW(std::invalid_argument("SVS V3 requires a Data signer"));
     }
@@ -97,6 +100,9 @@ SyncProtocolCodec::encode(const Name& groupPrefix,
     length += ndn::encoding::prependBlock(encoder, stateData.wireEncode());
   }
   else {
+    for (auto it = extensions.rbegin(); it != extensions.rend(); ++it) {
+      length += ndn::encoding::prependBlock(encoder, *it);
+    }
     length += ndn::encoding::prependBlock(encoder, stateVector.encodeV2());
   }
 
@@ -175,9 +181,23 @@ SyncProtocolCodec::decode(const Interest& interest,
     if (stateData.getName() != expectedPrefix || !stateData.getSignatureValue().isValid()) {
       NDN_THROW(ndn::tlv::Error("invalid SVS V3 State Vector Data"));
     }
-    const auto stateBlock = stateData.getContent().blockFromValue();
-    if (stateBlock.type() != tlv::StateVector) {
-      NDN_THROW(ndn::tlv::Error("SVS V3 StateVector Content", stateBlock.type()));
+    auto content = stateData.getContent();
+    content.parse();
+    if (content.elements().empty() || content.elements().front().type() != tlv::StateVector) {
+      NDN_THROW(ndn::tlv::Error("SVS V3 StateVector Content"));
+    }
+    for (auto it = std::next(content.elements_begin()); it != content.elements_end(); ++it) {
+      if (decoded.extensions.size() >= MAX_EXTENSION_BLOCKS) {
+        NDN_THROW(Error("too many SVS extension blocks"));
+      }
+      if (it->type() == tlv::StateVector || it->type() == ndn::tlv::Data) {
+        NDN_THROW(Error("duplicate SVS core envelope"));
+      }
+      if ((it->type() == tlv::MappingData || it->type() == tlv::RepairData) &&
+          !knownExtensionTypes.insert(it->type()).second) {
+        NDN_THROW(Error("duplicate known SVS extension"));
+      }
+      decoded.extensions.push_back(*it);
     }
     decoded.stateVectorData = std::move(stateData);
     if (decodeSemanticState) {
@@ -194,6 +214,9 @@ SyncProtocolCodec::decode(const Interest& interest,
   }
 
   for (++first; first != params.elements_end(); ++first) {
+    if (version == SvsProtocolVersion::V3) {
+      NDN_THROW(Error("SVS V3 extensions must be inside signed State Vector Data"));
+    }
     if (decoded.extensions.size() >= MAX_EXTENSION_BLOCKS) {
       NDN_THROW(Error("too many SVS extension blocks"));
     }
@@ -222,7 +245,12 @@ SyncProtocolCodec::decodeStateVector(const DecodedSyncEnvelope& envelope,
   if (version != SvsProtocolVersion::V3 || !envelope.stateVectorData) {
     NDN_THROW(Error("missing SVS V3 State Vector Data"));
   }
-  const auto stateBlock = envelope.stateVectorData->getContent().blockFromValue();
+  auto content = envelope.stateVectorData->getContent();
+  content.parse();
+  if (content.elements().empty()) {
+    NDN_THROW(Error("empty SVS V3 State Vector Data content"));
+  }
+  const auto& stateBlock = content.elements().front();
   if (stateBlock.type() != tlv::StateVector) {
     NDN_THROW(ndn::tlv::Error("SVS V3 StateVector Content", stateBlock.type()));
   }

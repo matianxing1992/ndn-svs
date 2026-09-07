@@ -110,7 +110,8 @@ BOOST_AUTO_TEST_CASE(DecodeRejectsMalformedCoreFixtures)
          "invalid/wrong-data-name.hex", "invalid/missing-signature.hex",
          "invalid/raw-state-vector.hex", "invalid/malformed-content.hex",
          "invalid/seq-zero.hex", "invalid/future-bootstrap.hex",
-         "invalid/duplicate-state-vector.hex", "invalid/unknown-core-tlv.hex"}) {
+         "invalid/duplicate-state-vector.hex", "invalid/unknown-core-tlv.hex",
+         "invalid/truncated-extension.hex", "invalid/unsigned-trailing-extension.hex"}) {
     BOOST_CHECK_EXCEPTION(
       SyncProtocolCodec::decode(makeFixtureInterest(loadFixture(fixture)),
                                 "/ndn/svs-v3-test", SvsProtocolVersion::V3),
@@ -160,7 +161,7 @@ BOOST_AUTO_TEST_CASE(V2RemainsExplicitAndRaw)
 #endif
 }
 
-BOOST_AUTO_TEST_CASE(TrailingExtensionsAreBoundedAndCoreIndependent)
+BOOST_AUTO_TEST_CASE(SignedExtensionsAreBoundedAndCoreIndependent)
 {
   VersionVector vector;
   vector.set("/node/a", 1700000000, 1);
@@ -180,6 +181,13 @@ BOOST_AUTO_TEST_CASE(TrailingExtensionsAreBoundedAndCoreIndependent)
   BOOST_CHECK_EQUAL(decoded.extensions.at(0).type(), ndn::svs::tlv::MappingData);
   BOOST_CHECK_EQUAL(decoded.extensions.at(1).type(), ndn::svs::tlv::RepairData);
   BOOST_CHECK_EQUAL(decoded.stateVector.get("/node/a", 1700000000), 1);
+  BOOST_REQUIRE(decoded.stateVectorData.has_value());
+  auto signedContent = decoded.stateVectorData->getContent();
+  signedContent.parse();
+  BOOST_REQUIRE_EQUAL(signedContent.elements_size(), 3);
+  BOOST_CHECK_EQUAL(signedContent.elements().at(0).type(), ndn::svs::tlv::StateVector);
+  BOOST_CHECK_EQUAL(signedContent.elements().at(1).type(), ndn::svs::tlv::MappingData);
+  BOOST_CHECK_EQUAL(signedContent.elements().at(2).type(), ndn::svs::tlv::RepairData);
 
   BOOST_CHECK_THROW(SyncProtocolCodec::encode("/ndn/svs-v3-test/extensions", vector,
                                                {mapping, mapping},
