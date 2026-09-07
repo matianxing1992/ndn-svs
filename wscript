@@ -76,8 +76,8 @@ def configure(conf):
         boost_libs.append('iostreams')
 
     conf.check_boost(lib=boost_libs, mt=True)
-    if conf.env.BOOST_VERSION_NUMBER < 107400:
-        conf.fatal('The minimum supported version of Boost is 1.74.0.\n'
+    if conf.env.BOOST_VERSION_NUMBER < 107100:
+        conf.fatal('The minimum supported version of Boost is 1.71.0.\n'
                    'Please upgrade your distribution or manually install a newer version of Boost.\n'
                    'For more information, see https://redmine.named-data.net/projects/nfd/wiki/Boost')
 

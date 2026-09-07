@@ -23,6 +23,7 @@
 #include <ndn-cxx/util/scheduler.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <queue>
 
 namespace ndn::svs {
@@ -30,6 +31,18 @@ namespace ndn::svs {
 class Fetcher
 {
 public:
+  struct Stats
+  {
+    uint64_t queued = 0;
+    uint64_t pending = 0;
+    uint16_t window = 0;
+    uint64_t dispatched = 0;
+    uint64_t data = 0;
+    uint64_t nacks = 0;
+    uint64_t timeouts = 0;
+    uint64_t retries = 0;
+  };
+
   Fetcher(Face& face, const SecurityOptions& securityOptions);
 
   ~Fetcher();
@@ -44,8 +57,24 @@ public:
   void
   setWindowSize(uint16_t windowSize)
   {
-    m_windowSize = std::max<uint16_t>(1, windowSize);
+    m_windowSize.store(std::max<uint16_t>(1, windowSize),
+                       std::memory_order_relaxed);
     processQueue();
+  }
+
+  Stats
+  getStats() const noexcept
+  {
+    return {
+      m_queuedCount.load(std::memory_order_relaxed),
+      m_pendingCount.load(std::memory_order_relaxed),
+      m_windowSize.load(std::memory_order_relaxed),
+      m_dispatchedCount.load(std::memory_order_relaxed),
+      m_dataCount.load(std::memory_order_relaxed),
+      m_nackCount.load(std::memory_order_relaxed),
+      m_timeoutCount.load(std::memory_order_relaxed),
+      m_retryCount.load(std::memory_order_relaxed),
+    };
   }
 
 private:
@@ -68,7 +97,14 @@ private:
   std::shared_ptr<std::atomic_bool> m_alive;
 
   uint64_t m_interestIdCounter = 0;
-  uint16_t m_windowSize = 10;
+  std::atomic<uint16_t> m_windowSize{10};
+  std::atomic<uint64_t> m_queuedCount{0};
+  std::atomic<uint64_t> m_pendingCount{0};
+  std::atomic<uint64_t> m_dispatchedCount{0};
+  std::atomic<uint64_t> m_dataCount{0};
+  std::atomic<uint64_t> m_nackCount{0};
+  std::atomic<uint64_t> m_timeoutCount{0};
+  std::atomic<uint64_t> m_retryCount{0};
 
   // Keep a scoped map of all pending interests.
   // This ensures all interests are cancelled when
@@ -87,6 +123,8 @@ private:
     int nRetries;
     int nRetriesOnValidationFail;
     ndn::security::DataValidationFailureCallback afterValidationFailed;
+    std::chrono::steady_clock::time_point queuedAt;
+    std::chrono::steady_clock::time_point dispatchedAt;
   };
 
   // Interests yet to be sent

@@ -62,6 +62,15 @@ toNdnDuration(std::chrono::steady_clock::duration value)
   return time::milliseconds(std::chrono::duration_cast<std::chrono::milliseconds>(value).count());
 }
 
+void
+updateAtomicMaximum(std::atomic<uint64_t>& destination, uint64_t value)
+{
+  auto current = destination.load(std::memory_order_relaxed);
+  while (current < value &&
+         !destination.compare_exchange_weak(current, value, std::memory_order_relaxed)) {
+  }
+}
+
 Block
 encodeRepairRequests(const std::vector<MissingDataInfo>& requests)
 {
@@ -145,6 +154,16 @@ SVSPubSub::SVSPubSub(const Name& syncPrefix,
   , m_piggyDataCacheLimit(std::max<size_t>(1, options.piggyDataCacheLimit))
   , m_asyncPublishAlive(std::make_shared<std::atomic_bool>(true))
 {
+  if (m_opts.publicationPreparationWorkers > 1) {
+    throw std::invalid_argument("publicationPreparationWorkers must be 0 or 1");
+  }
+  if (m_opts.publicationPreparationWorkers == 1 &&
+      m_opts.publicationPreparationQueueCapacity == 0) {
+    throw std::invalid_argument("publicationPreparationQueueCapacity must be positive");
+  }
+  if (m_opts.publicationPreparationWorkers == 1) {
+    m_publicationPreparationPool = std::make_unique<boost::asio::thread_pool>(1);
+  }
   m_svsync.setFetchInterestLifetime(
     clampDuration(m_opts.publicationFetchInterestLifetime,
                   m_opts.publicationFetchMinInterestLifetime,
@@ -162,6 +181,12 @@ SVSPubSub::~SVSPubSub()
   if (m_asyncPublishAlive) {
     m_asyncPublishAlive->store(false, std::memory_order_relaxed);
   }
+  if (m_publicationPreparationPool) {
+    m_publicationPreparationPool->join();
+    m_publicationPreparationPool.reset();
+  }
+  const auto outstanding = m_publicationOutstanding.exchange(0, std::memory_order_relaxed);
+  m_publicationCancelled.fetch_add(outstanding, std::memory_order_relaxed);
   std::vector<std::vector<Data>> unadvertised;
   {
     std::lock_guard<std::mutex> lock(m_asyncPublishMutex);
@@ -233,6 +258,7 @@ SVSPubSub::publishAsync(const Name& name, span<const uint8_t> value,
                         std::vector<Block> mappingBlocks)
 {
   std::lock_guard<std::mutex> orderLock(m_segmentedPublishMutex);
+  m_publicationSubmitted.fetch_add(1, std::memory_order_relaxed);
   AsyncPublication publication;
   publication.kind = AsyncPublication::Kind::Bytes;
   publication.name = name;
@@ -240,7 +266,17 @@ SVSPubSub::publishAsync(const Name& name, span<const uint8_t> value,
   publication.freshnessPeriod = freshnessPeriod;
   publication.value.assign(value.begin(), value.end());
   publication.mappingBlocks = std::move(mappingBlocks);
-  return prepareAndStageAsyncPublication(std::move(publication));
+  publication.counted = true;
+  if (m_publicationPreparationPool) {
+    return enqueuePublicationPreparation(std::move(publication));
+  }
+  try {
+    return prepareAndStageAsyncPublication(std::move(publication));
+  }
+  catch (...) {
+    m_publicationFailed.fetch_add(1, std::memory_order_relaxed);
+    throw;
+  }
 }
 
 
@@ -329,6 +365,7 @@ SVSPubSub::prepareAndStageAsyncPublication(AsyncPublication publication)
   reserved = std::max(reserved, m_svsync.getCore().getSeqNo(nid));
   publication.seqNo = reserved + 1;
   publication.bootstrapTime = m_svsync.getCore().getBootstrapTime();
+  publication.enqueuedAt = SteadyClock::now();
 
   PreparedPublication prepared;
   switch (publication.kind) {
@@ -352,6 +389,10 @@ SVSPubSub::prepareAndStageAsyncPublication(AsyncPublication publication)
     m_nextAsyncCommitSeq[nid] = publication.seqNo;
   }
   m_stagedPublicationPackets[nid][publication.seqNo] = prepared.outerPackets;
+  if (publication.counted) {
+    m_publicationAccepted.fetch_add(1, std::memory_order_relaxed);
+    m_publicationOutstanding.fetch_add(1, std::memory_order_relaxed);
+  }
   reservationLock.unlock();
 
   auto alive = m_asyncPublishAlive;
@@ -370,6 +411,181 @@ SVSPubSub::prepareAndStageAsyncPublication(AsyncPublication publication)
   return publication.seqNo;
 }
 
+SeqNo
+SVSPubSub::enqueuePublicationPreparation(AsyncPublication publication)
+{
+  {
+    std::lock_guard<std::mutex> lock(m_asyncPublishMutex);
+    if (m_failedPublicationProducers.count(publication.nodePrefix) != 0) {
+      m_publicationRejected.fetch_add(1, std::memory_order_relaxed);
+      throw std::runtime_error("publication producer stopped after preparation failure");
+    }
+  }
+  if (!tryAcquirePublicationPreparationSlot()) {
+    m_publicationRejected.fetch_add(1, std::memory_order_relaxed);
+    throw std::runtime_error("publication preparation queue is full");
+  }
+
+  const auto nid = publication.nodePrefix;
+  std::unique_lock<std::mutex> reservationLock(m_asyncPublishMutex);
+  SeqNo& reserved = m_reservedSeqNo[nid];
+  reserved = std::max(reserved, m_svsync.getCore().getSeqNo(nid));
+  publication.seqNo = reserved + 1;
+  publication.bootstrapTime = m_svsync.getCore().getBootstrapTime();
+  publication.enqueuedAt = SteadyClock::now();
+  const auto seqNo = publication.seqNo;
+  auto alive = m_asyncPublishAlive;
+  m_publicationAccepted.fetch_add(1, std::memory_order_relaxed);
+  m_publicationOutstanding.fetch_add(1, std::memory_order_relaxed);
+  try {
+    boost::asio::post(*m_publicationPreparationPool,
+                      [this, alive, publication = std::move(publication)] () mutable {
+                        if (!alive || !alive->load(std::memory_order_relaxed)) {
+                          releasePublicationPreparationSlot();
+                          finishCountedPublication(m_publicationCancelled);
+                          return;
+                        }
+                        preparePublicationOnWorker(std::move(publication));
+                      });
+  }
+  catch (...) {
+    reservationLock.unlock();
+    releasePublicationPreparationSlot();
+    m_publicationAccepted.fetch_sub(1, std::memory_order_relaxed);
+    m_publicationOutstanding.fetch_sub(1, std::memory_order_relaxed);
+    m_publicationRejected.fetch_add(1, std::memory_order_relaxed);
+    throw;
+  }
+
+  reserved = seqNo;
+  if (m_nextAsyncCommitSeq.find(nid) == m_nextAsyncCommitSeq.end()) {
+    m_nextAsyncCommitSeq[nid] = seqNo;
+  }
+  return seqNo;
+}
+
+void
+SVSPubSub::preparePublicationOnWorker(AsyncPublication publication)
+{
+  const auto serviceStarted = SteadyClock::now();
+  const auto queueWait = static_cast<uint64_t>(
+    std::chrono::duration_cast<std::chrono::nanoseconds>(
+      serviceStarted - publication.enqueuedAt).count());
+  m_publicationQueueWaitNsTotal.fetch_add(queueWait, std::memory_order_relaxed);
+  auto maxQueueWait = m_publicationQueueWaitNsMax.load(std::memory_order_relaxed);
+  while (maxQueueWait < queueWait &&
+         !m_publicationQueueWaitNsMax.compare_exchange_weak(
+           maxQueueWait, queueWait, std::memory_order_relaxed)) {
+  }
+  m_publicationStarted.fetch_add(1, std::memory_order_relaxed);
+  PreparedPublication prepared;
+  try {
+    prepared = prepareReservedBytes(publication);
+    m_publicationPrepared.fetch_add(1, std::memory_order_relaxed);
+  }
+  catch (const std::exception& e) {
+    prepared.seqNo = publication.seqNo;
+    prepared.bootstrapTime = publication.bootstrapTime;
+    prepared.nodePrefix = publication.nodePrefix;
+    prepared.mappingName = publication.name;
+    prepared.counted = true;
+    prepared.ok = false;
+    prepared.error = e.what();
+  }
+  catch (...) {
+    prepared.seqNo = publication.seqNo;
+    prepared.bootstrapTime = publication.bootstrapTime;
+    prepared.nodePrefix = publication.nodePrefix;
+    prepared.mappingName = publication.name;
+    prepared.counted = true;
+    prepared.ok = false;
+    prepared.error = "unknown publication preparation failure";
+  }
+  const auto serviceTime = static_cast<uint64_t>(
+    std::chrono::duration_cast<std::chrono::nanoseconds>(
+      SteadyClock::now() - serviceStarted).count());
+  m_publicationServiceNsTotal.fetch_add(serviceTime, std::memory_order_relaxed);
+  auto maxService = m_publicationServiceNsMax.load(std::memory_order_relaxed);
+  while (maxService < serviceTime &&
+         !m_publicationServiceNsMax.compare_exchange_weak(
+           maxService, serviceTime, std::memory_order_relaxed)) {
+  }
+  releasePublicationPreparationSlot();
+
+  auto alive = m_asyncPublishAlive;
+  if (!alive || !alive->load(std::memory_order_relaxed)) {
+    finishCountedPublication(m_publicationCancelled);
+    return;
+  }
+  boost::asio::post(m_face.getIoContext(),
+                    [this, alive, prepared = std::move(prepared)] () mutable {
+                      if (!alive || !alive->load(std::memory_order_relaxed)) {
+                        return;
+                      }
+                      onPreparedPublication(std::move(prepared));
+                    });
+}
+
+bool
+SVSPubSub::tryAcquirePublicationPreparationSlot()
+{
+  auto pending = m_publicationPreparationPending.load(std::memory_order_relaxed);
+  const auto capacity = static_cast<uint64_t>(m_opts.publicationPreparationQueueCapacity);
+  while (pending < capacity) {
+    if (m_publicationPreparationPending.compare_exchange_weak(
+          pending, pending + 1, std::memory_order_relaxed)) {
+      auto maximum = m_publicationPreparationMaxPending.load(std::memory_order_relaxed);
+      while (maximum < pending + 1 &&
+             !m_publicationPreparationMaxPending.compare_exchange_weak(
+               maximum, pending + 1, std::memory_order_relaxed)) {
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
+void
+SVSPubSub::releasePublicationPreparationSlot()
+{
+  m_publicationPreparationPending.fetch_sub(1, std::memory_order_relaxed);
+}
+
+void
+SVSPubSub::finishCountedPublication(std::atomic<uint64_t>& terminalCounter)
+{
+  auto outstanding = m_publicationOutstanding.load(std::memory_order_relaxed);
+  while (outstanding != 0) {
+    if (m_publicationOutstanding.compare_exchange_weak(
+          outstanding, outstanding - 1, std::memory_order_relaxed)) {
+      terminalCounter.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+  }
+}
+
+SVSPubSub::PublicationPreparationStats
+SVSPubSub::getPublicationPreparationStats() const noexcept
+{
+  PublicationPreparationStats stats;
+  stats.submitted = m_publicationSubmitted.load(std::memory_order_relaxed);
+  stats.accepted = m_publicationAccepted.load(std::memory_order_relaxed);
+  stats.rejected = m_publicationRejected.load(std::memory_order_relaxed);
+  stats.started = m_publicationStarted.load(std::memory_order_relaxed);
+  stats.prepared = m_publicationPrepared.load(std::memory_order_relaxed);
+  stats.committed = m_publicationCommitted.load(std::memory_order_relaxed);
+  stats.failed = m_publicationFailed.load(std::memory_order_relaxed);
+  stats.cancelled = m_publicationCancelled.load(std::memory_order_relaxed);
+  stats.pending = m_publicationPreparationPending.load(std::memory_order_relaxed);
+  stats.outstanding = m_publicationOutstanding.load(std::memory_order_relaxed);
+  stats.maxPending = m_publicationPreparationMaxPending.load(std::memory_order_relaxed);
+  stats.queueWaitNsTotal = m_publicationQueueWaitNsTotal.load(std::memory_order_relaxed);
+  stats.queueWaitNsMax = m_publicationQueueWaitNsMax.load(std::memory_order_relaxed);
+  stats.serviceNsTotal = m_publicationServiceNsTotal.load(std::memory_order_relaxed);
+  stats.serviceNsMax = m_publicationServiceNsMax.load(std::memory_order_relaxed);
+  return stats;
+}
+
 SVSPubSub::PreparedPublication
 SVSPubSub::prepareReservedBytes(const AsyncPublication& publication)
 {
@@ -380,6 +596,7 @@ SVSPubSub::prepareReservedBytes(const AsyncPublication& publication)
   prepared.mappingName = publication.name;
   prepared.freshnessPeriod = publication.freshnessPeriod;
   prepared.mappingBlocks = publication.mappingBlocks;
+  prepared.counted = publication.counted;
 
   ndn::Data data(publication.name);
   data.setContent(make_span(publication.value.data(), publication.value.size()));
@@ -389,10 +606,15 @@ SVSPubSub::prepareReservedBytes(const AsyncPublication& publication)
     m_securityOptions.dataSigner->sign(data);
   }
   const auto innerWireSize = data.wireEncode().size();
+  m_piggyPreparedCount.fetch_add(1, std::memory_order_relaxed);
+  m_piggyPreparedWireBytesTotal.fetch_add(innerWireSize, std::memory_order_relaxed);
+  updateAtomicMaximum(m_piggyPreparedWireBytesMax, innerWireSize);
   if (innerWireSize <= m_maxPiggyDataSize) {
+    m_piggyEligiblePrepared.fetch_add(1, std::memory_order_relaxed);
     prepared.piggyPacket = data;
   }
   else {
+    m_piggyIneligiblePrepared.fetch_add(1, std::memory_order_relaxed);
     NDN_LOG_TRACE("event=piggyback_skip reason=data_too_large bytes=" << innerWireSize
                   << " limit=" << m_maxPiggyDataSize
                   << " data=" << data.getName());
@@ -550,6 +772,8 @@ void
 SVSPubSub::onPreparedPublication(PreparedPublication publication)
 {
   const auto nodePrefix = publication.nodePrefix;
+  bool failed = false;
+  bool cancelled = false;
   {
     std::lock_guard<std::mutex> lock(m_asyncPublishMutex);
     auto stagedNode = m_stagedPublicationPackets.find(nodePrefix);
@@ -559,7 +783,33 @@ SVSPubSub::onPreparedPublication(PreparedPublication publication)
         m_stagedPublicationPackets.erase(stagedNode);
       }
     }
-    m_preparedPublications[nodePrefix][publication.seqNo] = std::move(publication);
+    if (!publication.ok) {
+      m_failedPublicationProducers.insert(nodePrefix);
+      failed = true;
+    }
+    else if (m_failedPublicationProducers.count(nodePrefix) != 0) {
+      cancelled = true;
+    }
+    if (failed || cancelled) {
+      // Do not expose a sequence after an asynchronous preparation failure.
+    }
+    else {
+      m_preparedPublications[nodePrefix][publication.seqNo] = std::move(publication);
+    }
+  }
+  if (failed) {
+    NDN_LOG_ERROR("event=async_publish_prepare_failed node=" << nodePrefix
+                  << " seq=" << publication.seqNo << " error=" << publication.error);
+    if (publication.counted) {
+      finishCountedPublication(m_publicationFailed);
+    }
+    return;
+  }
+  if (cancelled) {
+    if (publication.counted) {
+      finishCountedPublication(m_publicationCancelled);
+    }
+    return;
   }
   commitReadyPreparedPublications(nodePrefix);
 }
@@ -608,6 +858,9 @@ SVSPubSub::commitReadyPreparedPublications(const NodeID& nid)
       }
       commitPreparedPublication(publication);
       m_svsync.getCore().updateSeqNo(publication.seqNo, nid);
+      if (publication.counted) {
+        finishCountedPublication(m_publicationCommitted);
+      }
     }
     catch (const std::exception& e) {
       NDN_LOG_ERROR("event=async_publish_commit_failed node=" << publication.nodePrefix
@@ -773,12 +1026,61 @@ SVSPubSub::subscribeToProducer(const Name& nodePrefix, const SubscriptionCallbac
   return handle;
 }
 
+uint32_t
+SVSPubSub::subscribeToProducerWithCatchUp(
+  const Name& nodePrefix, const SubscriptionCallback& callback,
+  size_t maxKnownPublications, time::milliseconds catchUpAge,
+  bool prefetch, bool packets)
+{
+  uint32_t handle = ++m_subscriptionCount;
+  Subscription sub = { handle, nodePrefix, callback, packets, prefetch };
+  m_producerSubscriptions.push_back(sub);
+
+  if (maxKnownPublications == 0 || catchUpAge <= 0_ms) {
+    return handle;
+  }
+
+  const auto now = SteadyClock::now();
+  const auto maximumAge = toStdDuration(catchUpAge);
+  std::set<PublicationKey> catchUpPublications;
+  for (auto update = m_recentProducerUpdates.rbegin();
+       update != m_recentProducerUpdates.rend(); ++update) {
+    if (now - update->observedAt > maximumAge) {
+      break;
+    }
+    const auto& stream = update->stream;
+    if (!nodePrefix.isPrefixOf(stream.nodeId) || stream.low == 0 ||
+        stream.high < stream.low) {
+      continue;
+    }
+
+    for (SeqNo seqNo = stream.high; ; --seqNo) {
+      catchUpPublications.emplace(stream.nodeId, stream.bootstrapTime, seqNo);
+      if (catchUpPublications.size() >= maxKnownPublications ||
+          seqNo == stream.low) {
+        break;
+      }
+    }
+    if (catchUpPublications.size() >= maxKnownPublications) {
+      break;
+    }
+  }
+
+  for (const auto& publication : catchUpPublications) {
+    addPublicationFetch(publication, sub);
+  }
+
+  fetchAll();
+  return handle;
+}
+
 void
 SVSPubSub::unsubscribe(uint32_t handle)
 {
   auto unsub = [handle](std::vector<Subscription>& subs) {
     for (auto it = subs.begin(); it != subs.end(); ++it) {
       if (it->id == handle) {
+        it->active->store(false, std::memory_order_relaxed);
         subs.erase(it);
         return;
       }
@@ -795,6 +1097,13 @@ SVSPubSub::updateCallbackInternal(const std::vector<MissingDataInfo>& info)
 {
   for (const auto& stream : info) {
     Name streamName(stream.nodeId);
+
+    if (stream.low > 0 && stream.high >= stream.low) {
+      m_recentProducerUpdates.push_back({stream, SteadyClock::now()});
+      if (m_recentProducerUpdates.size() > MAX_RECENT_PRODUCER_UPDATES) {
+        m_recentProducerUpdates.pop_front();
+      }
+    }
 
     // Producer subscriptions
     for (const auto& sub : m_producerSubscriptions) {
@@ -851,10 +1160,19 @@ SVSPubSub::updateCallbackInternal(const std::vector<MissingDataInfo>& info)
 void
 SVSPubSub::addPublicationFetch(const PublicationKey& publication, const Subscription& sub)
 {
-  m_fetchMap[publication].push_back(sub);
+  auto& subscriptions = m_fetchMap[publication];
+  const auto duplicate = std::find_if(
+    subscriptions.begin(), subscriptions.end(),
+    [&sub] (const Subscription& existing) {
+      return existing.id == sub.id;
+    });
+  if (duplicate == subscriptions.end()) {
+    subscriptions.push_back(sub);
+  }
 
   auto& state = m_publicationFetchStates[publication];
   if (state.firstQueued == SteadyClock::time_point{}) {
+    m_publicationFetchFallbacks.fetch_add(1, std::memory_order_relaxed);
     const auto now = SteadyClock::now();
     const auto deadline = m_opts.maxPubAge > 0_ms ? m_opts.maxPubAge : 30_s;
     const ProducerSessionKey session(std::get<0>(publication), std::get<1>(publication));
@@ -874,6 +1192,10 @@ SVSPubSub::addPublicationFetch(const PublicationKey& publication, const Subscrip
                                           m_opts.publicationFetchMinInterestLifetime,
                                           m_opts.publicationFetchMaxInterestLifetime);
     state.currentBackoff = m_opts.publicationFetchFailureBackoff;
+    NDN_LOG_TRACE("event=publication_fetch_queued node=" << std::get<0>(publication)
+                  << " bootstrap=" << std::get<1>(publication)
+                  << " seq=" << std::get<2>(publication)
+                  << " lifetime_ms=" << state.currentLifetime.count());
   }
 }
 
@@ -929,7 +1251,7 @@ SVSPubSub::processMapping(const NodeID& nodeId, BootstrapTime bootstrapTime, Seq
           seqNo,
           packet
         };
-        sub.callback(subData);
+        sub.deliver(subData);
         deliveredFromPiggy = true;
       }
       else {
@@ -945,7 +1267,7 @@ SVSPubSub::processMapping(const NodeID& nodeId, BootstrapTime bootstrapTime, Seq
         seqNo,
         std::nullopt
       };
-      sub.callback(subData);
+      sub.deliver(subData);
     }
   };
 
@@ -962,6 +1284,7 @@ SVSPubSub::processMapping(const NodeID& nodeId, BootstrapTime bootstrapTime, Seq
   }
 
   if (deliveredFromPiggy) {
+    m_piggyDelivered.fetch_add(1, std::memory_order_relaxed);
     rememberPiggyDeliveredPublication(publication);
   }
 
@@ -1048,14 +1371,30 @@ SVSPubSub::scheduleMappingFetch(const MissingDataInfo& requested,
   if (suppress != m_mappingFetchSuppressUntil.end())
     m_mappingFetchSuppressUntil.erase(suppress);
   m_mappingFetchInFlight[key] = true;
+  NDN_LOG_TRACE("event=mapping_fetch_dispatch node=" << query.nodeId
+                << " bootstrap=" << query.bootstrapTime
+                << " low=" << query.low
+                << " high=" << query.high
+                << " retries=" << m_opts.mappingFetchRetries);
 
   m_mappingProvider.fetchNameMapping(
     query,
     [this, query, streamName, key](const MappingList& list) {
+      NDN_LOG_TRACE("event=mapping_fetch_data node=" << query.nodeId
+                    << " bootstrap=" << query.bootstrapTime
+                    << " low=" << query.low
+                    << " high=" << query.high
+                    << " returned=" << list.pairs.size());
       this->markMappingFetchComplete(key);
       this->onFetchedNameMappings(query, streamName, list);
     },
-    [this, key](const Interest&) {
+    [this, key, query](const Interest& interest) {
+      NDN_LOG_TRACE("event=mapping_fetch_timeout node=" << query.nodeId
+                    << " bootstrap=" << query.bootstrapTime
+                    << " low=" << query.low
+                    << " high=" << query.high
+                    << " name=" << interest.getName()
+                    << " nonce=" << interest.getNonce());
       this->markMappingFetchFailed(key);
     },
     m_opts.mappingFetchRetries);
@@ -1104,6 +1443,7 @@ SVSPubSub::markPublicationFetchFailed(const PublicationKey& key)
   }
 
   rememberRepairRequest(key);
+  m_publicationRetryActivations.fetch_add(1, std::memory_order_relaxed);
   state.status = PublicationFetchStatus::Backoff;
   if (state.currentBackoff <= 0_ms) {
     state.currentBackoff = m_opts.publicationFetchFailureBackoff;
@@ -1331,7 +1671,7 @@ SVSPubSub::fetchAll()
           packet,
         };
         for (const auto& sub : m_fetchMap[key]) {
-          sub.callback(subData);
+          sub.deliver(subData);
         }
         rememberPiggyDeliveredPublication(key);
         NDN_LOG_TRACE("event=piggyback_cache_satisfy data=" << packet->getName()
@@ -1353,6 +1693,13 @@ SVSPubSub::fetchAll()
     ++state.attempts;
     ++inFlight;
     m_svsync.setFetchInterestLifetime(state.currentLifetime);
+    NDN_LOG_TRACE("event=publication_fetch_dispatch node=" << nodeId
+                  << " bootstrap=" << bootstrapTime
+                  << " seq=" << seqNo
+                  << " attempt=" << state.attempts
+                  << " lifetime_ms=" << state.currentLifetime.count()
+                  << " in_flight=" << inFlight
+                  << " ready=" << ready.size());
     m_svsync.fetchData(nodeId, bootstrapTime, seqNo,
                        std::bind(&SVSPubSub::onSyncData, this, _1, key),
                        [](auto&&...) {},
@@ -1459,7 +1806,7 @@ SVSPubSub::onSyncData(const Data& firstData, const PublicationKey& publication)
 
     for (const auto& sub : fetchIt->second) {
       if (sub.isPacketSubscription || !hasFinalBlock)
-        sub.callback(subData);
+        sub.deliver(subData);
 
       hasBlobSubcriptions |= !sub.isPacketSubscription;
     }
@@ -1471,9 +1818,10 @@ SVSPubSub::onSyncData(const Data& firstData, const PublicationKey& publication)
       auto pubName = firstData.getName().getPrefix(-2);
       Interest interest(pubName); // strip off version and segment number
       ndn::SegmentFetcher::Options opts;
+      const std::optional<Data> firstPacket = *innerData;
       auto fetcher = ndn::SegmentFetcher::start(m_face, interest, m_nullValidator, opts);
 
-      fetcher->onComplete.connectSingleShot([this, alive, publication](const ndn::ConstBufferPtr& data) {
+      fetcher->onComplete.connectSingleShot([this, alive, publication, firstPacket](const ndn::ConstBufferPtr& data) {
         if (!alive->load(std::memory_order_relaxed)) {
           return;
         }
@@ -1503,7 +1851,12 @@ SVSPubSub::onSyncData(const Data& firstData, const PublicationKey& publication)
           state->payload = std::move(assembly->payload);
           state->expected = innerBlocks.size();
 
-          auto finishOne = [this, alive, publication, state](bool failed) {
+          // Preserve the first validated inner Data packet as transport
+          // evidence for blob subscribers.  The assembled callback carries
+          // the complete payload, while this packet supplies the authentic
+          // name/signature metadata without pretending the assembled blob is
+          // itself a newly signed Data packet.
+          auto finishOne = [this, alive, publication, state, firstPacket](bool failed) {
             bool finish = false;
             bool deliver = false;
             {
@@ -1527,11 +1880,11 @@ SVSPubSub::onSyncData(const Data& firstData, const PublicationKey& publication)
               if (it != m_fetchMap.end()) {
                 SubscriptionData subData = {
                   state->name, state->payload, std::get<0>(publication),
-                  std::get<2>(publication), std::nullopt,
+                  std::get<2>(publication), firstPacket,
                 };
                 for (const auto& sub : it->second) {
                   if (!sub.isPacketSubscription) {
-                    sub.callback(subData);
+                    sub.deliver(subData);
                   }
                 }
               }
@@ -1647,7 +2000,7 @@ SVSPubSub::satisfyPendingFetchFromPiggyData(const Data& data)
     };
 
     for (const auto& sub : subscriptions) {
-      sub.callback(subData);
+      sub.deliver(subData);
     }
     rememberPiggyDeliveredPublication(publication);
     cleanUpFetch(publication);
@@ -1657,6 +2010,31 @@ SVSPubSub::satisfyPendingFetchFromPiggyData(const Data& data)
                 << " matches=" << ready.size());
 
   return !ready.empty();
+}
+
+uint64_t
+SVSPubSub::acceptValidatedPiggyData(const Data& data)
+{
+  satisfyPendingFetchFromPiggyData(data);
+
+  const auto cacheStart = SteadyClock::now();
+  std::lock_guard<std::mutex> lock(m_extraDataMutex);
+  const auto dataName = data.getName();
+  if (m_piggyDataCache.find(dataName) == m_piggyDataCache.end()) {
+    m_piggyDataCacheOrder.push_back(dataName);
+  }
+  m_piggyDataCache[dataName] = data;
+  const auto fullName = data.getFullName();
+  if (m_piggyDataCache.find(fullName) == m_piggyDataCache.end()) {
+    m_piggyDataCacheOrder.push_back(fullName);
+  }
+  m_piggyDataCache[fullName] = data;
+  while (m_piggyDataCache.size() > m_piggyDataCacheLimit &&
+         !m_piggyDataCacheOrder.empty()) {
+    m_piggyDataCache.erase(m_piggyDataCacheOrder.front());
+    m_piggyDataCacheOrder.pop_front();
+  }
+  return elapsedUs(cacheStart, SteadyClock::now());
 }
 
 Block
@@ -1757,6 +2135,7 @@ SVSPubSub::onGetExtraData(const VersionVector&)
     }
   }
   m_piggyDataQueue = std::move(retained);
+  m_piggySent.fetch_add(piggyCount, std::memory_order_relaxed);
   const auto piggyDone = SteadyClock::now();
 
   std::deque<RepairRequestEntry> retainedRepairs;
@@ -1989,29 +2368,27 @@ SVSPubSub::onRecvExtraData(const Block& block, const VersionVector&)
       if (childBlock.type() == ndn::tlv::Data) {
         const auto childDataStart = SteadyClock::now();
         ndn::Data data(childBlock);
-        satisfyPendingFetchFromPiggyData(data);
         childDataParseUs += elapsedUs(childDataStart, SteadyClock::now());
-        try {
-          const auto cacheStart = SteadyClock::now();
-          std::lock_guard<std::mutex> lock(m_extraDataMutex);
-          const auto dataName = data.getName();
-          if (m_piggyDataCache.find(dataName) == m_piggyDataCache.end()) {
-            m_piggyDataCacheOrder.push_back(dataName);
-          }
-          m_piggyDataCache[dataName] = data;
-          const auto fullName = data.getFullName();
-          if (m_piggyDataCache.find(fullName) == m_piggyDataCache.end()) {
-            m_piggyDataCacheOrder.push_back(fullName);
-          }
-          m_piggyDataCache[fullName] = data;
-          while (m_piggyDataCache.size() > m_piggyDataCacheLimit &&
-                 !m_piggyDataCacheOrder.empty()) {
-            m_piggyDataCache.erase(m_piggyDataCacheOrder.front());
-            m_piggyDataCacheOrder.pop_front();
-          }
-          childCacheUs += elapsedUs(cacheStart, SteadyClock::now());
+        if (m_securityOptions.encapsulatedDataValidator) {
+          auto alive = m_asyncPublishAlive;
+          m_securityOptions.encapsulatedDataValidator->validate(
+            data,
+            [this, alive](const Data& validatedData) {
+              if (alive->load(std::memory_order_relaxed)) {
+                const auto cacheUs = acceptValidatedPiggyData(validatedData);
+                NDN_LOG_TRACE("event=piggyback_data_validated data="
+                              << validatedData.getName() << " cache_us=" << cacheUs);
+              }
+            },
+            [alive](const Data& rejectedData, const ValidationError& error) {
+              if (alive->load(std::memory_order_relaxed)) {
+                NDN_LOG_DEBUG("event=piggyback_data_validation_failed data="
+                              << rejectedData.getName() << " error=" << error);
+              }
+            });
         }
-        catch (const std::exception&) {
+        else {
+          childCacheUs += acceptValidatedPiggyData(data);
         }
         ++dataCount;
       }
@@ -2028,6 +2405,7 @@ SVSPubSub::onRecvExtraData(const Block& block, const VersionVector&)
         childRepairParseUs += elapsedUs(childRepairStart, SteadyClock::now());
       }
     }
+    m_piggyReceived.fetch_add(dataCount, std::memory_order_relaxed);
     NDN_LOG_TRACE("event=piggyback_recv_children mappings=" << mappingCount
                   << " data=" << dataCount
                   << " repairs=" << repairRequestCount);

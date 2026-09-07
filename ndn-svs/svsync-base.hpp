@@ -237,6 +237,12 @@ public:
     m_fetcher.setWindowSize(windowSize);
   }
 
+  Fetcher::Stats
+  getFetchStats() const noexcept
+  {
+    return m_fetcher.getStats();
+  }
+
   /** @brief Get the underlying SVS core */
   SVSyncCore& getCore()
   {

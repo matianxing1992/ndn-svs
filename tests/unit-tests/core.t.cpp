@@ -732,6 +732,35 @@ BOOST_AUTO_TEST_CASE(ParallelV3ProductionUsesCompleteEnvelope)
   BOOST_REQUIRE(envelope.stateVectorData.has_value());
 }
 
+BOOST_AUTO_TEST_CASE(ParallelV3ProductionPreservesWorkerBuiltExtensionsWhenSigningOnFace)
+{
+  DummyClientFace localFace;
+  SVSyncCore core(localFace, "/ndn/test/v3-parallel-extension", [] (const auto&) {});
+  core.setParallelSyncProduction(true, 1, 16, false, true);
+  core.setGetExtraBlockCallback([] (const VersionVector&) {
+    return Block(ndn::svs::tlv::MappingData);
+  });
+
+  core.sendInitialInterest();
+  core.updateSeqNo(1, "/local");
+  runIoUntil(localFace, [&] {
+    return std::any_of(localFace.sentInterests.begin(), localFace.sentInterests.end(),
+                       [] (const Interest& i) {
+                         return Name("/ndn/test/v3-parallel-extension").isPrefixOf(i.getName());
+                       });
+  });
+
+  const auto found = std::find_if(localFace.sentInterests.begin(), localFace.sentInterests.end(),
+                                  [] (const Interest& i) {
+                                    return Name("/ndn/test/v3-parallel-extension").isPrefixOf(i.getName());
+                                  });
+  BOOST_REQUIRE(found != localFace.sentInterests.end());
+  auto envelope = SyncProtocolCodec::decode(*found, "/ndn/test/v3-parallel-extension",
+                                            SvsProtocolVersion::V3);
+  BOOST_REQUIRE_EQUAL(envelope.extensions.size(), 1);
+  BOOST_CHECK_EQUAL(envelope.extensions.front().type(), ndn::svs::tlv::MappingData);
+}
+
 BOOST_AUTO_TEST_CASE(ParallelSyncProductionRecordsExtraBlockAndCompletesJobs)
 {
   size_t extraBlockInvocations = 0;

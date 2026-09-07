@@ -18,6 +18,7 @@
 
 #include <limits>
 #include <map>
+#include <set>
 #include <thread>
 
 namespace ndn::tests {
@@ -33,6 +34,31 @@ BOOST_AUTO_TEST_CASE(ExplicitV2ProfilePropagatesThroughPubSub)
   SVSPubSub pubsub("/ndn/test/profile", "/node", face, [] (const auto&) {}, options);
   BOOST_CHECK(pubsub.getSyncProtocolOptions().version == SvsProtocolVersion::V2);
   BOOST_CHECK_EQUAL(pubsub.getSyncProtocolOptions().syncInterestLifetime, 1_ms);
+}
+
+BOOST_AUTO_TEST_CASE(PublicationPreparationWorkerModeIsDefaultOffAndSingleOnly)
+{
+  DummyClientFace inlineFace;
+  SVSPubSubOptions inlineOptions;
+  SVSPubSub inlinePubsub("/sync/inline", "/node/inline", inlineFace,
+                         [] (const auto&) {}, inlineOptions);
+  BOOST_CHECK_EQUAL(inlinePubsub.getPublicationPreparationWorkerCount(), 0);
+
+  DummyClientFace workerFace;
+  SVSPubSubOptions workerOptions;
+  workerOptions.publicationPreparationWorkers = 1;
+  workerOptions.publicationPreparationQueueCapacity = 8;
+  SVSPubSub workerPubsub("/sync/worker", "/node/worker", workerFace,
+                         [] (const auto&) {}, workerOptions);
+  BOOST_CHECK_EQUAL(workerPubsub.getPublicationPreparationWorkerCount(), 1);
+
+  DummyClientFace invalidFace;
+  SVSPubSubOptions invalidOptions;
+  invalidOptions.publicationPreparationWorkers = 2;
+  BOOST_CHECK_THROW(
+    SVSPubSub("/sync/invalid", "/node/invalid", invalidFace,
+              [] (const auto&) {}, invalidOptions),
+    std::invalid_argument);
 }
 
 static void
@@ -105,6 +131,35 @@ private:
   KeyChainSigner m_delegate;
   mutable size_t m_calls = 0;
   size_t m_failAt = std::numeric_limits<size_t>::max();
+};
+
+class ThreadRecordingDataSigner final : public BaseSigner
+{
+public:
+  explicit ThreadRecordingDataSigner(KeyChain& keyChain)
+    : m_delegate(keyChain)
+  {
+  }
+
+  void
+  sign(Data& data) const override
+  {
+    m_delegate.sign(data);
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_threads.push_back(std::this_thread::get_id());
+  }
+
+  std::vector<std::thread::id>
+  threads() const
+  {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_threads;
+  }
+
+private:
+  mutable KeyChainSigner m_delegate;
+  mutable std::mutex m_mutex;
+  mutable std::vector<std::thread::id> m_threads;
 };
 
 class ThrowingDataStore final : public DataStore
@@ -307,6 +362,17 @@ BOOST_AUTO_TEST_CASE(TypedPiggybackLimitControlsPublicationQueue)
 
   BOOST_CHECK(defaultExtra.find(ndn::tlv::Data) != defaultExtra.elements_end());
   BOOST_CHECK(limitedExtra.find(ndn::tlv::Data) == limitedExtra.elements_end());
+  const auto defaultStats = defaultPubsub.getPiggybackStats();
+  const auto limitedStats = limitedPubsub.getPiggybackStats();
+  BOOST_CHECK_EQUAL(defaultStats.preparedCount, 1);
+  BOOST_CHECK_EQUAL(defaultStats.eligiblePrepared, 1);
+  BOOST_CHECK_EQUAL(defaultStats.ineligiblePrepared, 0);
+  BOOST_CHECK_GE(defaultStats.preparedWireBytesMax, payload.size());
+  BOOST_CHECK_GE(defaultStats.sent, 1);
+  BOOST_CHECK_EQUAL(limitedStats.preparedCount, 1);
+  BOOST_CHECK_EQUAL(limitedStats.eligiblePrepared, 0);
+  BOOST_CHECK_EQUAL(limitedStats.ineligiblePrepared, 1);
+  BOOST_CHECK_EQUAL(limitedStats.sent, 0);
 }
 
 BOOST_AUTO_TEST_CASE(LatePiggyDataSatisfiesPendingFetch)
@@ -362,6 +428,135 @@ BOOST_AUTO_TEST_CASE(LatePiggyDataSatisfiesPendingFetch)
   BOOST_CHECK_EQUAL(callbackCount, 1);
 }
 
+BOOST_AUTO_TEST_CASE(RejectedPiggyDataIsNotDeliveredToSubscribers)
+{
+  DummyClientFace face;
+  KeyChain keyChain("pib-memory:svspubsub-piggy-validation",
+                    "tpm-memory:svspubsub-piggy-validation");
+  keyChain.createIdentity("/svspubsub-test/piggy-validation");
+  SecurityOptions securityOptions(keyChain);
+  auto validator = std::make_shared<DeferredValidator>();
+  securityOptions.encapsulatedDataValidator = validator;
+  SVSPubSubOptions opts;
+  opts.useTimestamp = false;
+
+  SVSPubSub pubsub("/sync", "/local", face,
+                   [] (const std::vector<MissingDataInfo>&) {},
+                   opts, securityOptions);
+
+  size_t callbackCount = 0;
+  pubsub.subscribe("/app", [&] (const SVSPubSub::SubscriptionData&) {
+    ++callbackCount;
+  });
+
+  const BootstrapTime bootstrapTime = 101;
+  pubsub.insertMapping("/peer", bootstrapTime, 8, "/app/item", {});
+  BOOST_CHECK(pubsub.processMapping("/peer", bootstrapTime, 8));
+
+  Data piggyData("/app/item");
+  const std::string payload = "untrusted piggyback";
+  piggyData.setContent(make_span(reinterpret_cast<const uint8_t*>(payload.data()),
+                                 payload.size()));
+  keyChain.sign(piggyData);
+
+  MappingList extra("/peer");
+  extra.pairs.push_back({bootstrapTime, 8, {Name("/app/item"), {}}});
+  Block params = extra.encode();
+  params.push_back(piggyData.wireEncode());
+  params.encode();
+
+  pubsub.onRecvExtraData(params, VersionVector());
+  BOOST_CHECK_EQUAL(callbackCount, 0);
+
+  validator->reject();
+  BOOST_CHECK_EQUAL(callbackCount, 0);
+}
+
+BOOST_AUTO_TEST_CASE(ValidatedPiggyDataIsDeliveredExactlyOnce)
+{
+  DummyClientFace face;
+  KeyChain keyChain("pib-memory:svspubsub-piggy-validation-success",
+                    "tpm-memory:svspubsub-piggy-validation-success");
+  keyChain.createIdentity("/svspubsub-test/piggy-validation-success");
+  SecurityOptions securityOptions(keyChain);
+  auto validator = std::make_shared<DeferredValidator>();
+  securityOptions.encapsulatedDataValidator = validator;
+  SVSPubSubOptions opts;
+  opts.useTimestamp = false;
+
+  SVSPubSub pubsub("/sync", "/local", face,
+                   [] (const std::vector<MissingDataInfo>&) {},
+                   opts, securityOptions);
+
+  size_t callbackCount = 0;
+  std::string received;
+  pubsub.subscribe("/app", [&] (const SVSPubSub::SubscriptionData& data) {
+    ++callbackCount;
+    received.assign(reinterpret_cast<const char*>(data.data.data()), data.data.size());
+  });
+
+  const BootstrapTime bootstrapTime = 102;
+  pubsub.insertMapping("/peer", bootstrapTime, 9, "/app/item", {});
+  BOOST_CHECK(pubsub.processMapping("/peer", bootstrapTime, 9));
+
+  Data piggyData("/app/item");
+  const std::string payload = "trusted piggyback";
+  piggyData.setContent(make_span(reinterpret_cast<const uint8_t*>(payload.data()),
+                                 payload.size()));
+  keyChain.sign(piggyData);
+
+  MappingList extra("/peer");
+  extra.pairs.push_back({bootstrapTime, 9, {Name("/app/item"), {}}});
+  Block params = extra.encode();
+  params.push_back(piggyData.wireEncode());
+  params.encode();
+
+  pubsub.onRecvExtraData(params, VersionVector());
+  BOOST_CHECK_EQUAL(callbackCount, 0);
+
+  validator->succeed();
+  BOOST_CHECK_EQUAL(callbackCount, 1);
+  BOOST_CHECK_EQUAL(received, payload);
+
+  pubsub.onRecvExtraData(params, VersionVector());
+  BOOST_CHECK_EQUAL(callbackCount, 1);
+}
+
+BOOST_AUTO_TEST_CASE(RepeatedMappingDoesNotDuplicatePendingSubscription)
+{
+  DummyClientFace face;
+  SVSPubSubOptions opts;
+  opts.useTimestamp = false;
+  opts.maxPiggyDataSize = 1;
+
+  SVSPubSub pubsub("/sync", "/local", face,
+                   [] (const std::vector<MissingDataInfo>&) {},
+                   opts);
+
+  size_t callbackCount = 0;
+  pubsub.subscribe("/app", [&] (const SVSPubSub::SubscriptionData&) {
+    ++callbackCount;
+  });
+
+  const BootstrapTime bootstrapTime = 150;
+  pubsub.insertMapping("/peer", bootstrapTime, 1, "/app/item", {});
+  for (size_t round = 0; round < 5; ++round) {
+    BOOST_CHECK(pubsub.processMapping("/peer", bootstrapTime, 1));
+  }
+
+  KeyChain keyChain("pib-memory:svspubsub-repeat-test",
+                    "tpm-memory:svspubsub-repeat-test");
+  keyChain.createIdentity("/svspubsub-repeat-test");
+  Data publication("/app/item");
+  const std::string payload = "one delivery";
+  publication.setContent(make_span(reinterpret_cast<const uint8_t*>(payload.data()),
+                                   payload.size()));
+  keyChain.sign(publication);
+
+  BOOST_CHECK(pubsub.satisfyPendingFetchFromPiggyData(publication));
+  BOOST_CHECK_EQUAL(callbackCount, 1);
+}
+
 BOOST_AUTO_TEST_CASE(AsyncPublishQueuesWithoutImmediateFacePut)
 {
   DummyClientFace face;
@@ -389,6 +584,83 @@ BOOST_AUTO_TEST_CASE(AsyncPublishQueuesWithoutImmediateFacePut)
 
   BOOST_CHECK_EQUAL(pubsub.getSVSync().getCore().getSeqNo("/local"), 2);
   BOOST_REQUIRE_GE(face.sentData.size(), 2);
+}
+
+BOOST_AUTO_TEST_CASE(SingleWorkerPreparesOffFaceAndCommitsOnFaceInOrder)
+{
+  DummyClientFace face;
+  KeyChain keyChain("pib-memory:svspubsub-worker-thread-test",
+                    "tpm-memory:svspubsub-worker-thread-test");
+  keyChain.createIdentity("/svspubsub-worker-thread-test");
+  auto signer = std::make_shared<ThreadRecordingDataSigner>(keyChain);
+  SecurityOptions security(keyChain);
+  security.dataSigner = signer;
+  security.pubSigner = signer;
+
+  SVSPubSubOptions opts;
+  opts.useTimestamp = false;
+  opts.maxPiggyDataSize = 1;
+  opts.publicationPreparationWorkers = 1;
+  opts.publicationPreparationQueueCapacity = 512;
+
+  SVSPubSub pubsub("/sync/worker-thread", "/local/worker-thread", face,
+                   [] (const std::vector<MissingDataInfo>&) {},
+                   opts, security);
+
+  const auto faceThread = std::this_thread::get_id();
+  std::vector<std::thread::id> commitThreads;
+  std::vector<SeqNo> committedSeqs;
+  pubsub.setPreparedPublicationCommitHookForTest([&] (SeqNo seqNo) {
+    commitThreads.push_back(std::this_thread::get_id());
+    committedSeqs.push_back(seqNo);
+  });
+
+  constexpr size_t publicationCount = 128;
+  const auto payload = makePayload(256);
+  std::exception_ptr publisherError;
+  std::thread publisher([&] {
+    try {
+      for (size_t i = 0; i < publicationCount; ++i) {
+        pubsub.publishAsync(Name("/app/item").appendNumber(i), payload);
+      }
+    }
+    catch (...) {
+      publisherError = std::current_exception();
+    }
+  });
+
+  runIoUntil(face, [&] {
+    return pubsub.getPublicationPreparationStats().committed == publicationCount;
+  });
+  publisher.join();
+  if (publisherError) {
+    std::rethrow_exception(publisherError);
+  }
+  runIoUntil(face, [&] {
+    return pubsub.getPublicationPreparationStats().outstanding == 0;
+  });
+
+  const auto stats = pubsub.getPublicationPreparationStats();
+  BOOST_CHECK_EQUAL(stats.accepted, publicationCount);
+  BOOST_CHECK_EQUAL(stats.prepared, publicationCount);
+  BOOST_CHECK_EQUAL(stats.committed, publicationCount);
+  BOOST_CHECK_EQUAL(stats.failed, 0);
+  BOOST_CHECK_EQUAL(stats.outstanding, 0);
+  BOOST_REQUIRE_EQUAL(committedSeqs.size(), publicationCount);
+  for (size_t i = 0; i < committedSeqs.size(); ++i) {
+    BOOST_CHECK_EQUAL(committedSeqs[i], i + 1);
+  }
+  BOOST_CHECK(std::all_of(commitThreads.begin(), commitThreads.end(),
+                          [faceThread] (const auto& id) {
+                            return id == faceThread;
+                          }));
+
+  const auto signingThreads = signer->threads();
+  BOOST_REQUIRE(!signingThreads.empty());
+  BOOST_CHECK(std::all_of(signingThreads.begin(), signingThreads.end(),
+                          [faceThread] (const auto& id) {
+                            return id != faceThread;
+                          }));
 }
 
 BOOST_AUTO_TEST_CASE(AsyncPublishNameOnlyAndPacketAreQueuedAndCommitted)
@@ -524,6 +796,139 @@ BOOST_AUTO_TEST_CASE(MappingFetchBackoffSuppressesRetryAfterTimeout)
   BOOST_CHECK_EQUAL(face.sentInterests.size(), 1);
 }
 
+BOOST_AUTO_TEST_CASE(ProducerCatchUpFetchesKnownPublicationsAfterLateSubscription)
+{
+  DummyClientFace face;
+  SVSPubSubOptions opts;
+  opts.useTimestamp = false;
+  opts.publicationFetchWindow = 4;
+
+  SVSPubSub pubsub("/sync", "/local", face,
+                   [] (const std::vector<MissingDataInfo>&) {},
+                   opts);
+  runIoFor(face, 20_ms);
+  face.sentInterests.clear();
+
+  MissingDataInfo alreadyKnown;
+  alreadyKnown.nodeId = "/producer/session";
+  alreadyKnown.bootstrapTime = 500;
+  alreadyKnown.low = 1;
+  alreadyKnown.high = 3;
+
+  // The state arrives before the application installs its subscription.
+  pubsub.updateCallbackInternal({alreadyKnown});
+  runIoFor(face, 20_ms);
+  BOOST_CHECK(face.sentInterests.empty());
+
+  std::set<SeqNo> deliveredSequences;
+  pubsub.subscribeToProducerWithCatchUp(
+    "/producer",
+    [&] (const SVSPubSub::SubscriptionData& data) {
+      deliveredSequences.insert(data.seqNo);
+    },
+    2);
+  runIoUntil(face, [&] { return face.sentInterests.size() >= 2; });
+
+  const auto expectedSecond =
+    pubsub.getSVSync().getDataName(alreadyKnown.nodeId,
+                                  alreadyKnown.bootstrapTime, 2);
+  const auto expectedThird =
+    pubsub.getSVSync().getDataName(alreadyKnown.nodeId,
+                                  alreadyKnown.bootstrapTime, 3);
+  BOOST_REQUIRE_EQUAL(face.sentInterests.size(), 2);
+  const std::set<Name> fetchedNames = {
+    face.sentInterests[0].getName(), face.sentInterests[1].getName()
+  };
+  BOOST_CHECK_EQUAL(fetchedNames.count(expectedSecond), 1);
+  BOOST_CHECK_EQUAL(fetchedNames.count(expectedThird), 1);
+
+  KeyChain keyChain("pib-memory:svspubsub-late-producer",
+                    "tpm-memory:svspubsub-late-producer");
+  keyChain.createIdentity("/svspubsub-test/late-producer");
+  for (const auto& [seqNo, outerName] :
+       std::vector<std::pair<SeqNo, Name>>{{2, expectedSecond}, {3, expectedThird}}) {
+    Data inner(Name("/app/item").appendSequenceNumber(seqNo));
+    const auto body = makePayload(static_cast<size_t>(seqNo));
+    inner.setContent(body);
+    keyChain.sign(inner);
+
+    Data outer(outerName);
+    outer.setContent(inner.wireEncode());
+    outer.setContentType(ndn::tlv::Data);
+    keyChain.sign(outer);
+    face.receive(outer);
+  }
+  runIoUntil(face, [&] { return deliveredSequences.size() == 2; });
+  BOOST_CHECK_EQUAL(deliveredSequences.count(2), 1);
+  BOOST_CHECK_EQUAL(deliveredSequences.count(3), 1);
+}
+
+BOOST_AUTO_TEST_CASE(ProducerCatchUpDoesNotReplayExpiredKnownHistory)
+{
+  DummyClientFace face;
+  SVSPubSubOptions opts;
+  opts.useTimestamp = false;
+
+  SVSPubSub pubsub("/sync", "/local", face,
+                   [] (const std::vector<MissingDataInfo>&) {},
+                   opts);
+  runIoFor(face, 20_ms);
+  face.sentInterests.clear();
+
+  MissingDataInfo oldState;
+  oldState.nodeId = "/producer/session";
+  oldState.bootstrapTime = 600;
+  oldState.low = 1;
+  oldState.high = 100;
+  pubsub.updateCallbackInternal({oldState});
+  runIoFor(face, 20_ms);
+
+  pubsub.subscribeToProducerWithCatchUp(
+    "/producer", [] (const SVSPubSub::SubscriptionData&) {}, 4, 1_ms);
+  runIoFor(face, 20_ms);
+  BOOST_CHECK(face.sentInterests.empty());
+}
+
+BOOST_AUTO_TEST_CASE(UnsubscribedCatchUpDoesNotReceivePendingPublication)
+{
+  DummyClientFace face;
+  SVSPubSubOptions opts;
+  opts.useTimestamp = false;
+  SVSPubSub pubsub("/sync", "/local", face, [] (const auto&) {}, opts);
+  runIoFor(face, 20_ms);
+  face.sentInterests.clear();
+
+  MissingDataInfo known;
+  known.nodeId = "/producer/session";
+  known.bootstrapTime = 700;
+  known.low = known.high = 1;
+  pubsub.updateCallbackInternal({known});
+  size_t cancelledCalls = 0;
+  size_t activeCalls = 0;
+  const auto cancelled = pubsub.subscribeToProducerWithCatchUp(
+    "/producer", [&] (const auto&) { ++cancelledCalls; }, 1);
+  pubsub.subscribeToProducerWithCatchUp(
+    "/producer", [&] (const auto&) { ++activeCalls; }, 1);
+  runIoUntil(face, [&] { return !face.sentInterests.empty(); });
+  BOOST_REQUIRE(!face.sentInterests.empty());
+  pubsub.unsubscribe(cancelled);
+
+  KeyChain keys("pib-memory:catch-up-cancellation", "tpm-memory:catch-up-cancellation");
+  keys.createIdentity("/test/catch-up-cancellation");
+  Data inner("/app/cancel-test");
+  const auto payload = makePayload(8);
+  inner.setContent(payload);
+  keys.sign(inner);
+  Data outer(pubsub.getSVSync().getDataName(known.nodeId, known.bootstrapTime, 1));
+  outer.setContent(inner.wireEncode());
+  outer.setContentType(ndn::tlv::Data);
+  keys.sign(outer);
+  face.receive(outer);
+  runIoUntil(face, [&] { return activeCalls == 1; });
+  BOOST_CHECK_EQUAL(activeCalls, 1);
+  BOOST_CHECK_EQUAL(cancelledCalls, 0);
+}
+
 BOOST_AUTO_TEST_CASE(SmallDataIsPiggybackedAcrossMultipleRounds)
 {
   DummyClientFace face;
@@ -580,6 +985,7 @@ BOOST_AUTO_TEST_CASE(PublicationFetchTimeoutBacksOffAndIncreasesLifetime)
   runIoFor(face, 90_ms);
   BOOST_REQUIRE_GE(face.sentInterests.size(), 2);
   BOOST_CHECK_EQUAL(face.sentInterests.back().getInterestLifetime(), 100_ms);
+  BOOST_CHECK_GE(pubsub.getPiggybackStats().publicationRetryActivations, 1);
 }
 
 BOOST_AUTO_TEST_CASE(RepairRequestRepiggybacksProducerData)

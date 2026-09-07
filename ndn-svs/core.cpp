@@ -953,6 +953,11 @@ SVSyncCore::sendSyncInterest()
         extensions = {m_getExtraBlock(result.job.localVector)};
         result.extraBlockBuiltInWorker = true;
       }
+      // V3 envelope signing stays on the Face thread when
+      // m_parallelSyncProductionSigning is disabled. Preserve extensions
+      // prepared by the worker so processSyncProductionResult() encodes the
+      // same envelope instead of silently dropping them.
+      result.job.extraBlocks = extensions;
 
       // A V3 Data signature is covered by the parameters digest. If signer
       // thread use was not explicitly enabled, defer both encoding and signing

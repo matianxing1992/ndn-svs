@@ -34,6 +34,7 @@
 #include <atomic>
 #include <chrono>
 #include <optional>
+#include <set>
 #include <tuple>
 
 #include <boost/asio/thread_pool.hpp>
@@ -169,6 +170,18 @@ struct SVSPubSubOptions
 
   /** @brief Maximum delay between asynchronous commit-head retries. */
   time::milliseconds asyncCommitRetryMax = 1_s;
+
+  /**
+   * @brief Number of workers used for byte-publication preparation.
+   *
+   * Zero preserves the existing inline behavior. One moves immutable packet
+   * construction, encoding, and signing to a single FIFO worker. Values above
+   * one are not supported.
+   */
+  size_t publicationPreparationWorkers = 0;
+
+  /** @brief Maximum accepted byte publications pending in the preparation worker. */
+  size_t publicationPreparationQueueCapacity = 1024;
 };
 
 /**
@@ -203,6 +216,83 @@ public:
   getSyncProtocolOptions() const noexcept
   {
     return m_svsync.getCore().getProtocolOptions();
+  }
+
+  size_t
+  getPublicationPreparationWorkerCount() const noexcept
+  {
+    return m_opts.publicationPreparationWorkers;
+  }
+
+  struct PublicationPreparationStats
+  {
+    uint64_t submitted = 0;
+    uint64_t accepted = 0;
+    uint64_t rejected = 0;
+    uint64_t started = 0;
+    uint64_t prepared = 0;
+    uint64_t committed = 0;
+    uint64_t failed = 0;
+    uint64_t cancelled = 0;
+    uint64_t pending = 0;
+    uint64_t outstanding = 0;
+    uint64_t maxPending = 0;
+    uint64_t queueWaitNsTotal = 0;
+    uint64_t queueWaitNsMax = 0;
+    uint64_t serviceNsTotal = 0;
+    uint64_t serviceNsMax = 0;
+  };
+
+  PublicationPreparationStats
+  getPublicationPreparationStats() const noexcept;
+
+  struct PiggybackStats
+  {
+    uint64_t preparedCount = 0;
+    uint64_t preparedWireBytesTotal = 0;
+    uint64_t preparedWireBytesMax = 0;
+    uint64_t eligiblePrepared = 0;
+    uint64_t ineligiblePrepared = 0;
+    uint64_t sent = 0;
+    uint64_t received = 0;
+    uint64_t delivered = 0;
+    uint64_t publicationFetchFallbacks = 0;
+    uint64_t publicationRetryActivations = 0;
+  };
+
+  PiggybackStats
+  getPiggybackStats() const noexcept
+  {
+    return {
+      m_piggyPreparedCount.load(std::memory_order_relaxed),
+      m_piggyPreparedWireBytesTotal.load(std::memory_order_relaxed),
+      m_piggyPreparedWireBytesMax.load(std::memory_order_relaxed),
+      m_piggyEligiblePrepared.load(std::memory_order_relaxed),
+      m_piggyIneligiblePrepared.load(std::memory_order_relaxed),
+      m_piggySent.load(std::memory_order_relaxed),
+      m_piggyReceived.load(std::memory_order_relaxed),
+      m_piggyDelivered.load(std::memory_order_relaxed),
+      m_publicationFetchFallbacks.load(std::memory_order_relaxed),
+      m_publicationRetryActivations.load(std::memory_order_relaxed),
+    };
+  }
+
+  size_t
+  getMaxPiggyDataSize() const noexcept
+  {
+    return m_maxPiggyDataSize;
+  }
+
+  Fetcher::Stats
+  getPublicationFetchStats() const noexcept
+  {
+    return m_svsync.getFetchStats();
+  }
+
+  Fetcher::Stats
+  getMappingFetchStats() const noexcept
+  {
+    return m_mappingProvider.getFetchStats();
   }
 
   struct SubscriptionData
@@ -245,11 +335,16 @@ public:
   /**
    * @brief Prepare a publication safely and defer its advertisement.
    *
-   * The existing publish() API remains synchronous. This API completes all
-   * fallible signing, final encoding, and local storage before returning the
-   * reserved sequence number. Mapping installation, optional active Data
-   * emission, and state-vector advertisement are deferred to the Face
-   * io_context and commit in sequence order.
+   * The existing publish() API remains synchronous. With
+   * publicationPreparationWorkers == 0, this API prepares the publication on
+   * the calling thread and defers its commit to the Face io_context. With one
+   * preparation worker, this byte-oriented overload copies the input before
+   * returning, reserves a sequence in call order, and may be invoked from an
+   * application thread; fallible construction, encoding, and signing then run
+   * on the worker. Mapping installation, optional active Data emission, and
+   * state-vector advertisement always remain Face-owned and commit in sequence
+   * order. The off-Face caller guarantee does not apply to the name-only or
+   * packet overloads.
    */
   SeqNo
   publishAsync(const Name& name, span<const uint8_t> value,
@@ -316,6 +411,35 @@ public:
                                bool packets = false);
 
   /**
+   * @brief Subscribe to a producer and fetch a bounded suffix of publications
+   *        already observed through synchronization.
+   *
+   * Normal producer subscriptions receive only publications observed after
+   * the subscription is installed. This variant closes the race where the
+   * state vector is merged immediately before a dependent application installs
+   * its subscription. Catch-up is bounded across all matching producer
+   * sessions together.
+   *
+   * @param nodePrefix Prefix of the producer
+   * @param callback Callback when data is received from the producer
+   * @param maxKnownPublications Maximum number of already-known publications
+   *        to fetch across matching producer sessions
+   * @param catchUpAge Maximum age of a synchronization update eligible for
+   *        catch-up
+   * @param prefetch Mark as low latency stream and prefetch data
+   * @param packets Subscribe to the raw Data packets instead of BLOBs
+   *
+   * @returns Handle to the subscription
+   */
+  uint32_t subscribeToProducerWithCatchUp(
+    const Name& nodePrefix,
+    const SubscriptionCallback& callback,
+    size_t maxKnownPublications,
+    time::milliseconds catchUpAge = 1_s,
+    bool prefetch = false,
+    bool packets = false);
+
+  /**
    * @brief Unsubscribe from a stream using a handle
    *
    * @param handle Handle received during subscription
@@ -359,11 +483,27 @@ NDN_SVS_PUBLIC_WITH_TESTS_ELSE_PRIVATE:
     bool prefetch;
     bool autofetch = true;
     std::shared_ptr<Regex> regex = make_shared<Regex>("^<>+$");
+    // Copies in pending fetches share cancellation with the registered owner.
+    // Subscription mutation and delivery remain owned by the Face thread.
+    std::shared_ptr<std::atomic_bool> active = std::make_shared<std::atomic_bool>(true);
+
+    void deliver(const SubscriptionData& data) const
+    {
+      if (active->load(std::memory_order_relaxed)) {
+        callback(data);
+      }
+    }
   };
 
   using PublicationKey = std::tuple<Name, BootstrapTime, SeqNo>;
   using MappingFetchKey = std::tuple<Name, BootstrapTime, SeqNo, SeqNo>;
   using ProducerSessionKey = std::tuple<Name, BootstrapTime>;
+
+  struct RecentProducerUpdate
+  {
+    MissingDataInfo stream;
+    std::chrono::steady_clock::time_point observedAt;
+  };
 
   void onSyncData(const Data& syncData, const PublicationKey& publication);
 
@@ -379,6 +519,9 @@ NDN_SVS_PUBLIC_WITH_TESTS_ELSE_PRIVATE:
 
   bool
   satisfyPendingFetchFromPiggyData(const Data& data);
+
+  uint64_t
+  acceptValidatedPiggyData(const Data& data);
 
   bool
   hasPiggyDeliveredPublication(const PublicationKey& publication);
@@ -443,6 +586,8 @@ NDN_SVS_PUBLIC_WITH_TESTS_ELSE_PRIVATE:
     std::vector<uint8_t> value;
     Data packet;
     std::vector<Block> mappingBlocks;
+    bool counted = false;
+    std::chrono::steady_clock::time_point enqueuedAt;
   };
 
   struct PreparedPublication
@@ -458,6 +603,8 @@ NDN_SVS_PUBLIC_WITH_TESTS_ELSE_PRIVATE:
     bool putFirstPacketToFace = false;
     bool stored = false;
     bool ok = true;
+    bool counted = false;
+    std::string error;
     size_t commitAttempts = 0;
     bool retryScheduled = false;
   };
@@ -518,6 +665,21 @@ NDN_SVS_PUBLIC_WITH_TESTS_ELSE_PRIVATE:
 
   SeqNo
   prepareAndStageAsyncPublication(AsyncPublication publication);
+
+  SeqNo
+  enqueuePublicationPreparation(AsyncPublication publication);
+
+  void
+  preparePublicationOnWorker(AsyncPublication publication);
+
+  bool
+  tryAcquirePublicationPreparationSlot();
+
+  void
+  releasePublicationPreparationSlot();
+
+  void
+  finishCountedPublication(std::atomic<uint64_t>& terminalCounter);
 
   void
   onPreparedPublication(PreparedPublication publication);
@@ -618,6 +780,8 @@ private:
   std::vector<Subscription> m_producerSubscriptions;
   std::vector<Subscription> m_prefixSubscriptions;
   std::vector<Subscription> m_regexSubscriptions;
+  std::deque<RecentProducerUpdate> m_recentProducerUpdates;
+  static constexpr size_t MAX_RECENT_PRODUCER_UPDATES = 4096;
 
   // Queue of publications to fetch
   std::map<PublicationKey, std::vector<Subscription>> m_fetchMap;
@@ -654,6 +818,34 @@ private:
   std::shared_ptr<std::atomic_bool> m_asyncPublishAlive;
   std::mutex m_asyncPublishSigningMutex;
   std::function<void(SeqNo)> m_preparedPublicationCommitHook;
+
+  std::unique_ptr<boost::asio::thread_pool> m_publicationPreparationPool;
+  std::set<NodeID> m_failedPublicationProducers;
+  std::atomic<uint64_t> m_publicationSubmitted{0};
+  std::atomic<uint64_t> m_publicationAccepted{0};
+  std::atomic<uint64_t> m_publicationRejected{0};
+  std::atomic<uint64_t> m_publicationStarted{0};
+  std::atomic<uint64_t> m_publicationPrepared{0};
+  std::atomic<uint64_t> m_publicationCommitted{0};
+  std::atomic<uint64_t> m_publicationFailed{0};
+  std::atomic<uint64_t> m_publicationCancelled{0};
+  std::atomic<uint64_t> m_publicationPreparationPending{0};
+  std::atomic<uint64_t> m_publicationOutstanding{0};
+  std::atomic<uint64_t> m_publicationPreparationMaxPending{0};
+  std::atomic<uint64_t> m_publicationQueueWaitNsTotal{0};
+  std::atomic<uint64_t> m_publicationQueueWaitNsMax{0};
+  std::atomic<uint64_t> m_publicationServiceNsTotal{0};
+  std::atomic<uint64_t> m_publicationServiceNsMax{0};
+  std::atomic<uint64_t> m_piggyPreparedCount{0};
+  std::atomic<uint64_t> m_piggyPreparedWireBytesTotal{0};
+  std::atomic<uint64_t> m_piggyPreparedWireBytesMax{0};
+  std::atomic<uint64_t> m_piggyEligiblePrepared{0};
+  std::atomic<uint64_t> m_piggyIneligiblePrepared{0};
+  std::atomic<uint64_t> m_piggySent{0};
+  std::atomic<uint64_t> m_piggyReceived{0};
+  std::atomic<uint64_t> m_piggyDelivered{0};
+  std::atomic<uint64_t> m_publicationFetchFallbacks{0};
+  std::atomic<uint64_t> m_publicationRetryActivations{0};
 };
 
 } // namespace ndn::svs

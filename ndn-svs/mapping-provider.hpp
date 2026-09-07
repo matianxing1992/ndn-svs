@@ -112,6 +112,12 @@ public:
     m_fetcher.setWindowSize(windowSize);
   }
 
+  Fetcher::Stats
+  getFetchStats() const noexcept
+  {
+    return m_fetcher.getStats();
+  }
+
 private:
   /**
    * @brief Return data name for mapping query

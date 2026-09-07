@@ -18,8 +18,11 @@
 #include "store-memory.hpp"
 
 #include <ndn-cxx/security/signing-helpers.hpp>
+#include <ndn-cxx/util/logger.hpp>
 
 namespace ndn::svs {
+
+NDN_LOG_INIT(ndn_svs.SVSyncBase);
 
 SVSyncBase::SVSyncBase(const Name& syncPrefix,
                        const Name& dataPrefix,
@@ -205,13 +208,43 @@ SVSyncBase::putPreparedData(const Data& data)
 void
 SVSyncBase::onDataInterest(const Interest& interest)
 {
+  const auto lookupStart = std::chrono::steady_clock::now();
+  const auto lookupStartNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    lookupStart.time_since_epoch()).count();
+  const auto nonce = interest.getNonce();
+  NDN_LOG_TRACE("event=producer_interest"
+                << " name=" << interest.getName()
+                << " nonce=" << nonce
+                << " mono_ns=" << lookupStartNs);
   std::shared_ptr<const Data> data;
   {
     std::lock_guard<std::mutex> lock(m_dataStoreMutex);
     data = m_dataStore->find(interest);
   }
-  if (data != nullptr)
+  const auto lookupUs = std::chrono::duration_cast<std::chrono::microseconds>(
+    std::chrono::steady_clock::now() - lookupStart).count();
+  if (data != nullptr) {
+    NDN_LOG_TRACE("event=producer_store_hit"
+                  << " name=" << interest.getName()
+                  << " nonce=" << nonce
+                  << " mono_ns=" << lookupStartNs
+                  << " lookup_us=" << lookupUs
+                  << " data_name=" << data->getName());
     m_face.put(*data);
+    NDN_LOG_TRACE("event=producer_data_put"
+                  << " name=" << interest.getName()
+                  << " nonce=" << nonce
+                  << " mono_ns=" << std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch()).count()
+                  << " data_name=" << data->getName());
+  }
+  else {
+    NDN_LOG_TRACE("event=producer_store_miss"
+                  << " name=" << interest.getName()
+                  << " nonce=" << nonce
+                  << " mono_ns=" << lookupStartNs
+                  << " lookup_us=" << lookupUs);
+  }
 }
 
 void

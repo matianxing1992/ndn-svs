@@ -17,9 +17,12 @@
 #include "mapping-provider.hpp"
 #include "tlv.hpp"
 
+#include <ndn-cxx/util/logger.hpp>
 #include <ndn-cxx/util/time.hpp>
 
 namespace ndn::svs {
+
+NDN_LOG_INIT(ndn_svs.MappingProvider);
 
 namespace {
 
@@ -149,6 +152,10 @@ MappingProvider::getMapping(const NodeID& nodeId, BootstrapTime bootstrapTime,
 void
 MappingProvider::onMappingQuery(const Interest& interest)
 {
+  const auto nonce = interest.getNonce();
+  NDN_LOG_TRACE("event=mapping_producer_interest"
+                << " name=" << interest.getName()
+                << " nonce=" << nonce);
   MissingDataInfo query;
   try {
     query = parseMappingQueryDataName(interest.getName());
@@ -172,14 +179,22 @@ MappingProvider::onMappingQuery(const Interest& interest)
   }
 
   // Don't reply if we have nothing
-  if (queryResponse.pairs.empty())
+  if (queryResponse.pairs.empty()) {
+    NDN_LOG_TRACE("event=mapping_producer_empty"
+                  << " name=" << interest.getName()
+                  << " nonce=" << nonce);
     return;
+  }
 
   Data data(interest.getName());
   data.setContent(queryResponse.encode());
   data.setFreshnessPeriod(1_s);
   m_securityOptions.dataSigner->sign(data);
   m_face.put(data);
+  NDN_LOG_TRACE("event=mapping_producer_data_put"
+                << " name=" << interest.getName()
+                << " nonce=" << nonce
+                << " returned=" << queryResponse.pairs.size());
 }
 
 void
