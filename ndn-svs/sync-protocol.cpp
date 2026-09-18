@@ -10,7 +10,7 @@ namespace ndn::svs {
 ResolvedSyncProtocolOptions
 SyncProtocolOptions::resolve() const
 {
-  if (periodicJitter < 0.0 || periodicJitter > 1.0) {
+  if (!std::isfinite(periodicJitter) || periodicJitter < 0.0 || periodicJitter > 1.0) {
     NDN_THROW(std::invalid_argument("SVS periodic jitter must be in [0,1]"));
   }
 

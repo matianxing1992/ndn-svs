@@ -7,6 +7,7 @@
 #include <ndn-cxx/util/string-helper.hpp>
 
 #include <fstream>
+#include <limits>
 #include <sstream>
 
 namespace ndn::tests {
@@ -50,6 +51,21 @@ BOOST_AUTO_TEST_CASE(ProfileDefaultsAndOverrides)
   BOOST_CHECK_EQUAL(v3.periodicTimeout, 30_s);
   BOOST_CHECK_CLOSE(v3.periodicJitter, 0.1, 0.001);
 
+}
+
+BOOST_AUTO_TEST_CASE(PeriodicJitterRange)
+{
+  SyncProtocolOptions options;
+  for (double value : {std::numeric_limits<double>::quiet_NaN(),
+                       std::numeric_limits<double>::infinity(),
+                       -std::numeric_limits<double>::infinity(), -0.1, 1.1}) {
+    options.periodicJitter = value;
+    BOOST_CHECK_THROW(options.resolve(), std::invalid_argument);
+  }
+  for (double value : {0.0, 0.1, 1.0}) {
+    options.periodicJitter = value;
+    BOOST_CHECK_EQUAL(options.resolve().periodicJitter, value);
+  }
 }
 
 BOOST_AUTO_TEST_CASE(EncodeMatchesIndependentOneNodeFixture)

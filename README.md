@@ -11,14 +11,12 @@ ndn-svs uses the [ndn-cxx](https://github.com/named-data/ndn-cxx) library.
 
 ## Protocol specifications
 
-This implementation targets the following specifications, pinned to StateVectorSync
-revision `8f0b1c5332ff7e7c56b8c5edc247e5f42b671b11`:
+This library implements SVS v3 and SVS-PS v3, targeting these specification revisions:
 
 * [SVS version 3](https://github.com/named-data/StateVectorSync/blob/8f0b1c5332ff7e7c56b8c5edc247e5f42b671b11/Specification.md), last updated 2026-07-17.
 * [SVS-PS version 3](https://github.com/named-data/StateVectorSync/blob/8f0b1c5332ff7e7c56b8c5edc247e5f42b671b11/PubSubSpec.md), last updated 2026-07-24.
 
-SVS version 2 is not supported. The dates above identify the specifications,
-not the library release or a claim of compatibility with later revisions.
+SVS version 2 is not supported.
 
 ## Installation
 

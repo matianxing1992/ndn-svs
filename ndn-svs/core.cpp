@@ -65,9 +65,8 @@ SVSyncCore::SVSyncCore(ndn::Face& face,
   , m_scheduler(m_face.getIoContext())
 {
   m_validationGate->owner = this;
-  // Dispatch and advertise the version-specific Sync Interest prefix.  SVS
-  // The protocol defines this exact name (/<group-prefix>/v=3) as the prefix-announcement
-  // name; registering only the group prefix does not satisfy the specification.
+  // Dispatch and advertise the version-specific Sync Interest prefix.
+  // The required announcement name is /<group-prefix>/v=3, not just the group prefix.
   m_syncInterestFilter =
     m_face.setInterestFilter(m_syncInterestPrefix,
                              std::bind(&SVSyncCore::onSyncInterest, this, _2));
