@@ -27,7 +27,7 @@ namespace ndn::svs {
  * @brief SVSync using shared prefix for data delivery
  *
  * Sync core runs under <grp-prefix>/s/
- * V3 Data is produced as <grp-prefix>/d/<node-id>/<bootstrap-time>/<seq>
+ * Data is produced as <grp-prefix>/d/<node-id>/<bootstrap-time>/<seq>
  * Both prefixes use multicast strategy, so all nodes receive
  * data interests for all other nodes.
  */

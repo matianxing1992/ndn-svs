@@ -29,6 +29,7 @@ struct Options
 {
   std::string prefix;
   std::string m_id;
+  std::string subscriptionRegex;
 };
 
 class Program
@@ -57,8 +58,8 @@ public:
 
     std::cout << "SVS client starting: " << m_options.m_id << std::endl;
 
-    // Subscribe to all data packets with prefix /chat (the "topic")
-    m_svsps->subscribe(ndn::Name("/chat"), [](const auto& subData) {
+    // Share the callback between prefix and regular-expression subscriptions.
+    auto onPublication = [](const auto& subData) {
       std::string content(reinterpret_cast<const char*>(subData.data.data()), subData.data.size());
       std::cout << subData.producerPrefix << " [" << subData.seqNo << "] : " << subData.name << " : ";
       if (content.length() > 200) {
@@ -68,7 +69,13 @@ public:
         std::cout << content;
       }
       std::cout << std::endl;
-    });
+    };
+    if (m_options.subscriptionRegex.empty()) {
+      m_svsps->subscribe(ndn::Name("/chat"), onPublication);
+    }
+    else {
+      m_svsps->subscribeWithRegex(ndn::Regex(m_options.subscriptionRegex), onPublication);
+    }
   }
 
   void run()
@@ -143,14 +150,17 @@ private:
 int
 main(int argc, char** argv)
 {
-  if (argc != 2) {
-    std::cerr << "Usage: " << argv[0] << " <prefix>" << std::endl;
+  if (argc != 2 && argc != 3) {
+    std::cerr << "Usage: " << argv[0] << " <node-prefix> [subscription-regex]" << std::endl;
     return 1;
   }
 
   Options opt;
   opt.prefix = "/ndn/svs";
   opt.m_id = argv[1];
+  if (argc == 3) {
+    opt.subscriptionRegex = argv[2];
+  }
 
   Program program(opt);
   program.run();

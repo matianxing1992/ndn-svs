@@ -95,6 +95,7 @@ main(int argc, char** argv)
   Options opt;
   opt.prefix = "/ndn/svs";
   opt.m_id = argv[1];
+
   Program program(opt);
   program.run();
 

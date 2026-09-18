@@ -61,7 +61,7 @@ SyncProtocolCodec::encode(const Name& groupPrefix,
   content.encode();
   stateData.setContent(content);
   if (!signData) {
-    NDN_THROW(std::invalid_argument("SVS V3 requires a Data signer"));
+    NDN_THROW(std::invalid_argument("SVS requires a Data signer"));
   }
   signData(stateData);
   length += ndn::encoding::prependBlock(encoder, stateData.wireEncode());
@@ -102,19 +102,19 @@ SyncProtocolCodec::decode(const Interest& interest,
   DecodedSyncEnvelope decoded;
   auto first = params.elements_begin();
   if (version != SvsProtocolVersion::V3 || first->type() != ndn::tlv::Data) {
-    NDN_THROW(ndn::tlv::Error("SVS V3 State Vector Data", first->type()));
+    NDN_THROW(ndn::tlv::Error("SVS State Vector Data", first->type()));
   }
   if (std::next(first) != params.elements_end()) {
-    NDN_THROW(Error("SVS V3 ApplicationParameters must contain one Data"));
+    NDN_THROW(Error("SVS ApplicationParameters must contain one Data"));
   }
   Data stateData(*first);
   if (stateData.getName() != expectedPrefix || !stateData.getSignatureValue().isValid()) {
-    NDN_THROW(ndn::tlv::Error("invalid SVS V3 State Vector Data"));
+    NDN_THROW(ndn::tlv::Error("invalid SVS State Vector Data"));
   }
   auto content = stateData.getContent();
   content.parse();
   if (content.elements().size() != 1 || content.elements().front().type() != tlv::StateVector) {
-    NDN_THROW(ndn::tlv::Error("SVS V3 StateVector Content"));
+    NDN_THROW(ndn::tlv::Error("SVS StateVector Content"));
   }
   decoded.stateVectorData = std::move(stateData);
   if (decodeSemanticState) {
@@ -129,16 +129,16 @@ SyncProtocolCodec::decodeStateVector(const DecodedSyncEnvelope& envelope,
                                      SvsProtocolVersion version)
 {
   if (version != SvsProtocolVersion::V3 || !envelope.stateVectorData) {
-    NDN_THROW(Error("missing SVS V3 State Vector Data"));
+    NDN_THROW(Error("missing SVS State Vector Data"));
   }
   auto content = envelope.stateVectorData->getContent();
   content.parse();
   if (content.elements().empty()) {
-    NDN_THROW(Error("empty SVS V3 State Vector Data content"));
+    NDN_THROW(Error("empty SVS State Vector Data content"));
   }
   const auto& stateBlock = content.elements().front();
   if (stateBlock.type() != tlv::StateVector) {
-    NDN_THROW(ndn::tlv::Error("SVS V3 StateVector Content", stateBlock.type()));
+    NDN_THROW(ndn::tlv::Error("SVS StateVector Content", stateBlock.type()));
   }
   return VersionVector(stateBlock);
 }

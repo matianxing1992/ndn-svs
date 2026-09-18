@@ -28,7 +28,7 @@ namespace ndn::svs {
  *
  * The data prefix acts as the node ID in the version vector
  * Sync core runs under <sync-prefix>
- * V3 Data is produced as <data-prefix>/<sync-prefix>/<bootstrap-time>/<seq>
+ * Data is produced as <data-prefix>/<sync-prefix>/<bootstrap-time>/<seq>
  */
 class SVSync : public SVSyncBase
 {

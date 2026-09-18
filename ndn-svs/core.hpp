@@ -59,12 +59,18 @@ using UpdateCallback = std::function<void(const std::vector<MissingDataInfo>&)>;
 class SVSyncCore : noncopyable
 {
 public:
+  /**
+   * @brief Most recently recorded Sync Interest validation outcome.
+   *
+   * Diagnostic only: concurrent or asynchronous validations may complete out
+   * of arrival order. This value is not authorization for a particular packet.
+   */
   enum class ValidationStatus : uint8_t
   {
-    Never,
-    Verified,
-    StructuralUnverified,
-    Rejected,
+    Never, ///< No validation outcome recorded yet.
+    Verified, ///< Configured validator accepted the embedded Data.
+    StructuralUnverified, ///< Packet structure checked without a configured validator.
+    Rejected, ///< Packet structure, vector decoding or validation failed.
   };
 
   class Error : public std::runtime_error
@@ -80,8 +86,9 @@ public:
    * @param face The face used to communication
    * @param syncPrefix The prefix of the sync group
    * @param onUpdate The callback function to handle state updates
-   * @param syncKey Base64 encoded key to sign sync interests
+   * @param securityOptions Signer and validator configuration
    * @param nid ID for the node
+   * @param protocolOptions Timer settings and optional bootstrap-time override
    */
   SVSyncCore(ndn::Face& face,
              const Name& syncPrefix,
@@ -125,11 +132,16 @@ public:
     return m_bootstrapTime;
   }
 
+  /// @brief Return the effective timer options and configured bootstrap-time override.
   const ResolvedSyncProtocolOptions& getProtocolOptions() const noexcept
   {
     return m_protocolOptions;
   }
 
+  /**
+   * @brief Read a race-free diagnostic snapshot, without synchronizing protocol state.
+   * @see ValidationStatus
+   */
   ValidationStatus getLastValidationStatus() const noexcept
   {
     return m_lastValidationStatus.load(std::memory_order_relaxed);
@@ -248,6 +260,9 @@ public:
 private:
   struct ValidationGate
   {
+    // Shared with asynchronous validator callbacks, which may outlive this core.
+    // Serialize callback access to owner with destruction clearing owner;
+    // checking a raw pointer without this lock would not protect its lifetime.
     std::mutex mutex;
     SVSyncCore* owner = nullptr;
   };
@@ -292,6 +307,8 @@ private:
   // Security
   ndn::KeyChain m_keyChainMem;
   std::shared_ptr<ValidationGate> m_validationGate = std::make_shared<ValidationGate>();
+  // Callbacks write while another thread may poll the public diagnostic getter.
+  // Relaxed ordering suffices: this snapshot does not publish other core state.
   std::atomic<ValidationStatus> m_lastValidationStatus{ValidationStatus::Never};
 
   ndn::Scheduler m_scheduler;

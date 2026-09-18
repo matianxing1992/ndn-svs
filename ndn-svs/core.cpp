@@ -66,7 +66,7 @@ SVSyncCore::SVSyncCore(ndn::Face& face,
 {
   m_validationGate->owner = this;
   // Dispatch and advertise the version-specific Sync Interest prefix.  SVS
-  // V3 defines this exact name (/<group-prefix>/v=3) as the prefix-announcement
+  // The protocol defines this exact name (/<group-prefix>/v=3) as the prefix-announcement
   // name; registering only the group prefix does not satisfy the specification.
   m_syncInterestFilter =
     m_face.setInterestFilter(m_syncInterestPrefix,
@@ -122,7 +122,7 @@ SVSyncCore::onSyncInterest(const Interest& interest)
   }
   catch (const std::exception& e) {
     m_lastValidationStatus.store(ValidationStatus::Rejected, std::memory_order_relaxed);
-    NDN_LOG_DEBUG("Reject malformed SVS V3 Sync Interest: " << e.what());
+    NDN_LOG_DEBUG("Reject malformed SVS Sync Interest: " << e.what());
     return;
   }
 

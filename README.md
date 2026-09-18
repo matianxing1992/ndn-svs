@@ -9,6 +9,17 @@ synchronization between multiple clients over NDN.
 
 ndn-svs uses the [ndn-cxx](https://github.com/named-data/ndn-cxx) library.
 
+## Protocol specifications
+
+This implementation targets the following specifications, pinned to StateVectorSync
+revision `8f0b1c5332ff7e7c56b8c5edc247e5f42b671b11`:
+
+* [SVS version 3](https://github.com/named-data/StateVectorSync/blob/8f0b1c5332ff7e7c56b8c5edc247e5f42b671b11/Specification.md), last updated 2026-07-17.
+* [SVS-PS version 3](https://github.com/named-data/StateVectorSync/blob/8f0b1c5332ff7e7c56b8c5edc247e5f42b671b11/PubSubSpec.md), last updated 2026-07-24.
+
+SVS version 2 is not supported. The dates above identify the specifications,
+not the library release or a claim of compatibility with later revisions.
+
 ## Installation
 
 ### Prerequisites
@@ -32,7 +43,7 @@ To try out the demo CLI chat application:
 
     ./waf configure --enable-static --disable-shared --with-examples
     ./waf
-    ./build/examples/chat <prefix>
+    ./build/examples/chat <node-prefix>
 
 Configure NFD to be multicast:
 
@@ -43,6 +54,11 @@ Clear the content store of NFD if you restart the example:
     nfdc cs erase /
 
 where `sync-prefix` is `/ndn/svs` for the example application.
+
+The Pub/Sub chat example subscribes to the `/chat` prefix by default. To use
+an NDN name-component regular expression instead, pass it as a second argument:
+
+    ./build/examples/chat-pubsub /node/alice '^<chat><>*$'
 
 ## Contributing
 

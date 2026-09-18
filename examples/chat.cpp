@@ -112,7 +112,7 @@ int
 main(int argc, char** argv)
 {
   if (argc != 2) {
-    std::cerr << "Usage: " << argv[0] << " <prefix>" << std::endl;
+    std::cerr << "Usage: " << argv[0] << " <node-prefix>" << std::endl;
     return 1;
   }
 
