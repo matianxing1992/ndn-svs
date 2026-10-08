@@ -285,8 +285,20 @@ uint32_t
 SVSPubSub::subscribe(const Name& prefix, const SubscriptionCallback& callback, bool packets)
 {
   uint32_t handle = ++m_subscriptionCount;
-  Subscription sub = {handle, prefix, callback, packets, false};
+  Subscription sub = {handle, prefix, callback, packets, false, nullptr};
   m_prefixSubscriptions.push_back(sub);
+  return handle;
+}
+
+uint32_t
+SVSPubSub::subscribeWithRegex(const Regex& regex,
+                              const SubscriptionCallback& callback,
+                              bool packets)
+{
+  auto matcher = std::make_shared<Regex>(regex.getExpr());
+  uint32_t handle = ++m_subscriptionCount;
+  Subscription sub = {handle, Name(), callback, packets, false, std::move(matcher)};
+  m_prefixSubscriptions.push_back(std::move(sub));
   return handle;
 }
 
@@ -297,7 +309,7 @@ SVSPubSub::subscribeToProducer(const Name& nodePrefix,
                                bool packets)
 {
   uint32_t handle = ++m_subscriptionCount;
-  Subscription sub = {handle, nodePrefix, callback, packets, prefetch};
+  Subscription sub = {handle, nodePrefix, callback, packets, prefetch, nullptr};
   m_producerSubscriptions.push_back(sub);
   return handle;
 }
@@ -439,7 +451,7 @@ SVSPubSub::processMapping(const NodeID& nodeId, BootstrapTime bootstrapTime, Seq
   // check if known mapping matches subscription
   bool queued = false;
   for (const auto& sub : m_prefixSubscriptions) {
-    if (sub.prefix.isPrefixOf(mapping.first)) {
+    if (sub.matches(mapping.first)) {
       m_fetchMap[PublicationKey(nodeId, bootstrapTime, seqNo)].push_back(sub);
       queued = true;
     }
@@ -465,7 +477,7 @@ SVSPubSub::getSubscriptions(const PublicationKey& publication, const Name& name)
                                         [&] (const auto& sub) { return sub.id == queued.id; });
     const bool isTopic = std::any_of(
       m_prefixSubscriptions.begin(), m_prefixSubscriptions.end(), [&] (const auto& sub) {
-        return sub.id == queued.id && sub.prefix.isPrefixOf(name) && hasMatchingMapping;
+        return sub.id == queued.id && sub.matches(name) && hasMatchingMapping;
       });
     if (isProducer || isTopic)
       subscriptions.push_back(queued);
@@ -474,7 +486,7 @@ SVSPubSub::getSubscriptions(const PublicationKey& publication, const Name& name)
   // when a mapping filter or publication-age limit is configured.
   if (!m_opts.mappingFilter && m_opts.maxPubAge == 0_ms) {
     for (const auto& sub : m_prefixSubscriptions) {
-      if (sub.prefix.isPrefixOf(name) &&
+      if (sub.matches(name) &&
           std::none_of(subscriptions.begin(), subscriptions.end(), [&] (const auto& queued) {
             return queued.id == sub.id;
           }))

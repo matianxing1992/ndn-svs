@@ -381,6 +381,61 @@ BOOST_AUTO_TEST_CASE(SegmentsAreValidatedAndDeliveredOnce)
   }
 }
 
+BOOST_AUTO_TEST_CASE(RegexSubscriptionsUseNamesAndExistingFetchPaths)
+{
+  for (bool producerSubscription : {false, true}) {
+    for (bool segmented : {false, true}) {
+      boost::asio::io_context io;
+      DummyClientFace::Options faceOptions;
+      faceOptions.enableRegistrationReply = true;
+      DummyClientFace producer(io, faceOptions), consumer(io, faceOptions);
+      producer.linkTo(consumer);
+      SVSPubSubOptions options;
+      options.bootstrapTime = 100;
+      SVSPubSub source("/group", "/node", producer, [] (const auto&) {}, options);
+      options.bootstrapTime = 200;
+      SVSPubSub target("/group", "/reader", consumer, [] (const auto&) {}, options);
+      size_t blobs = 0, packets = 0, prefixes = 0;
+      const std::vector<uint8_t> payload(segmented ? 16000 : 3, 42);
+      auto handle =
+        target.subscribeWithRegex(Regex("^<app><camera-[0-9]+>$"), [&] (const auto& item) {
+          ++blobs;
+          BOOST_CHECK_EQUAL(item.name, "/app/camera-1");
+          BOOST_CHECK_EQUAL_COLLECTIONS(
+            item.data.begin(), item.data.end(), payload.begin(), payload.end());
+        });
+      auto packetHandle = target.subscribeWithRegex(
+        Regex("^<app><camera-[0-9]+>$"),
+        [&] (const auto& item) {
+          ++packets;
+          BOOST_REQUIRE(item.packet.has_value());
+          BOOST_CHECK(Name("/app/camera-1").isPrefixOf(item.packet->getName()));
+        },
+        true);
+      target.subscribe("/app/camera-1", [&] (const auto&) { ++prefixes; });
+      if (producerSubscription)
+        target.subscribeToProducer("/node", [] (const auto&) {});
+      io.run_for(std::chrono::milliseconds(20));
+      io.restart();
+      source.publish("/app/camera-1", payload);
+      source.publish("/app/other", payload);
+      io.run_for(std::chrono::milliseconds(150));
+      BOOST_CHECK_EQUAL(blobs, 1);
+      BOOST_CHECK_GE(packets, 1);
+      BOOST_CHECK_EQUAL(prefixes, 1);
+      const auto before = packets;
+      target.unsubscribe(handle);
+      target.unsubscribe(packetHandle);
+      io.restart();
+      source.publish("/app/camera-1", payload);
+      io.run_for(std::chrono::milliseconds(150));
+      BOOST_CHECK_EQUAL(blobs, 1);
+      BOOST_CHECK_EQUAL(packets, before);
+      BOOST_CHECK_EQUAL(prefixes, 2);
+    }
+  }
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 } // namespace ndn::tests
