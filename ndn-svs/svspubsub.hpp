@@ -24,6 +24,7 @@
 #include "svsync.hpp"
 
 #include <ndn-cxx/security/validator.hpp>
+#include <ndn-cxx/util/regex.hpp>
 #include <ndn-cxx/util/scheduler.hpp>
 #include <ndn-cxx/util/segment-fetcher.hpp>
 
@@ -162,6 +163,19 @@ public:
   uint32_t subscribe(const Name& prefix, const SubscriptionCallback& callback, bool packets = false);
 
   /**
+   * @brief Subscribe to application names matching an ndn-cxx name regex.
+   *
+   * @param regex Component-based NDN name regex, not a URI/string regex
+   * @param callback Callback when matching data is received
+   * @param packets Subscribe to raw Data packets instead of BLOBs
+   *
+   * @returns Handle accepted by unsubscribe()
+   */
+  uint32_t subscribeWithRegex(const Regex& regex,
+                              const SubscriptionCallback& callback,
+                              bool packets = false);
+
+  /**
    * @brief Subscribe to a data producer
    *
    * @param nodePrefix Prefix of the producer
@@ -214,6 +228,13 @@ private:
     SubscriptionCallback callback;
     bool isPacketSubscription;
     bool prefetch;
+    std::shared_ptr<Regex> regex;
+
+    bool
+    matches(const Name& name) const
+    {
+      return regex ? regex->match(name) : prefix.isPrefixOf(name);
+    }
   };
 
   using PublicationKey = std::tuple<Name, BootstrapTime, SeqNo>;

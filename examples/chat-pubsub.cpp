@@ -58,6 +58,8 @@ public:
     std::cout << "SVS client starting: " << m_options.m_id << std::endl;
 
     // Subscribe to all data packets with prefix /chat (the "topic")
+    // For regex matching, replace subscribe(Name("/chat"), callback) with
+    // subscribeWithRegex(ndn::Regex("^<chat><>*$"), callback).
     m_svsps->subscribe(ndn::Name("/chat"), [](const auto& subData) {
       std::string content(reinterpret_cast<const char*>(subData.data.data()), subData.data.size());
       std::cout << subData.producerPrefix << " [" << subData.seqNo << "] : " << subData.name << " : ";
