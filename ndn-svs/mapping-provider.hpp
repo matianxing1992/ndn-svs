@@ -21,6 +21,7 @@
 #include "fetcher.hpp"
 
 #include <map>
+#include <mutex>
 
 namespace ndn::svs {
 
@@ -60,25 +61,34 @@ public:
 
   virtual ~MappingProvider() = default;
 
+  /** @brief Serve mappings for a locally published node, not a cached remote node. */
+  void addLocalNode(const NodeID& id);
+
   using MappingListCallback = std::function<void(const MappingList&)>;
 
   /**
    * @brief Insert a mapping entry into the store
    */
-  void insertMapping(const NodeID& nodeId, const SeqNo& seqNo, const MappingEntryPair& entry);
+  void insertMapping(const NodeID& nodeId,
+                     BootstrapTime bootstrapTime,
+                     const SeqNo& seqNo,
+                     const MappingEntryPair& entry);
 
   /**
    * @brief Get a mapping and throw if not found
    *
    * @returns Corresponding application name
    */
-  MappingEntryPair getMapping(const NodeID& nodeId, const SeqNo& seqNo);
+  MappingEntryPair getMapping(const NodeID& nodeId,
+                              BootstrapTime bootstrapTime,
+                              const SeqNo& seqNo);
 
   /**
    * @brief Retrieve the data mappings for encapsulated data packets
    *
    * @param info Query info
    * @param onValidated Callback when mapping is fetched and validated
+   * Failed ranges are split; this callback may report several complete subranges.
    */
   void fetchNameMapping(const MissingDataInfo& info,
                         const MappingListCallback& onValidated,
@@ -96,7 +106,7 @@ public:
                         const TimeoutCallback& onTimeout,
                         int nRetries = 0);
 
-private:
+NDN_SVS_PUBLIC_WITH_TESTS_ELSE_PRIVATE:
   /**
    * @brief Return data name for mapping query
    */
@@ -110,15 +120,23 @@ private:
   void onMappingQuery(const Interest& interest);
 
 private:
+  /** @brief Prepare a bounded signed singleton before inserting a local mapping. */
+  void validateMappingSize(const NodeID& id,
+                           BootstrapTime bootstrapTime,
+                           SeqNo seq,
+                           const MappingEntryPair& entry);
+
   const Name m_syncPrefix;
-  const NodeID m_id;
   Face& m_face;
   Fetcher m_fetcher;
   const SecurityOptions m_securityOptions;
 
-  ndn::ScopedRegisteredPrefixHandle m_registeredPrefix;
+  std::map<NodeID, ndn::ScopedRegisteredPrefixHandle> m_interestFilters;
 
   std::map<Name, MappingEntryPair> m_map;
+  std::map<Name, std::shared_ptr<const Data>> m_localMappingPackets;
+  std::mutex m_mutex;
+  std::shared_ptr<int> m_lifetime = std::make_shared<int>(0);
 };
 
 } // namespace ndn::svs

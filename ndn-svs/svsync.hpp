@@ -19,14 +19,17 @@
 
 #include "svsync-base.hpp"
 
+#include <limits>
+
 namespace ndn::svs {
 
 /**
  * @brief SVSync using arbitrary prefix for data delivery
  *
  * The data prefix acts as the node ID in the version vector
- * Sync core runs under <sync-prefix>
- * Data is produced as <data-prefix>/<sync-prefix>/<seq>
+ * Sync Interests use <sync-prefix>/v=3/<parameters-digest>
+ * Data is produced as <data-prefix>/<sync-prefix>/t=<timestamp>/seq=<seq>
+ * The timestamp component encodes bootstrapTime * 1000, with bootstrapTime in Unix seconds.
  */
 class SVSync : public SVSyncBase
 {
@@ -36,20 +39,30 @@ public:
          ndn::Face& face,
          const UpdateCallback& updateCallback,
          const SecurityOptions& securityOptions = SecurityOptions::DEFAULT,
-         std::shared_ptr<DataStore> dataStore = DEFAULT_DATASTORE)
+         std::shared_ptr<DataStore> dataStore = DEFAULT_DATASTORE,
+         std::optional<BootstrapTime> bootstrapTime = std::nullopt)
     : SVSyncBase(syncPrefix,
                  Name(nodePrefix).append(syncPrefix),
                  nodePrefix,
                  face,
                  updateCallback,
                  securityOptions,
-                 std::move(dataStore))
+                 std::move(dataStore),
+                 bootstrapTime)
   {
   }
 
-  Name getDataName(const NodeID& nid, const SeqNo& seqNo) override
+  Name
+  getDataName(const NodeID& nid, const BootstrapTime& bootstrapTime, const SeqNo& seqNo) override
   {
-    return Name(nid).append(m_syncPrefix).appendNumber(seqNo);
+    constexpr uint64_t BOOTSTRAP_TIME_NAME_SCALE = 1000;
+    if (bootstrapTime > std::numeric_limits<uint64_t>::max() / BOOTSTRAP_TIME_NAME_SCALE)
+      NDN_THROW(std::overflow_error("bootstrap time exceeds the timestamp name range"));
+    return Name(nid)
+      .append(m_syncPrefix)
+      .append(name::Component::fromNumber(bootstrapTime * BOOTSTRAP_TIME_NAME_SCALE,
+                                          ndn::tlv::TimestampNameComponent))
+      .appendSequenceNumber(seqNo);
   }
 };
 

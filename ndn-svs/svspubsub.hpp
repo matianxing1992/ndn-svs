@@ -23,7 +23,13 @@
 #include "store.hpp"
 #include "svsync.hpp"
 
-#include <ndn-cxx/security/validator-null.hpp>
+#include <ndn-cxx/security/validator.hpp>
+#include <ndn-cxx/util/scheduler.hpp>
+#include <ndn-cxx/util/segment-fetcher.hpp>
+
+#include <mutex>
+#include <set>
+#include <tuple>
 
 namespace ndn::svs {
 
@@ -49,6 +55,30 @@ struct SVSPubSubOptions
    * The useTimestamp option should be enabled for this to work.
    */
   time::milliseconds maxPubAge = 0_ms;
+
+  /** @brief Persisted session timestamp in Unix seconds; defaults to now. */
+  std::optional<BootstrapTime> bootstrapTime;
+
+  /** @brief Retry limits for data and mappings; -1 retries indefinitely. */
+  int dataRetries = 12;
+  int mappingRetries = -1;
+
+  /** @brief Fetch failure, or validation failure after partial delivery even if retrying. */
+  std::function<void(const Name&)> onFetchError;
+
+  /** @brief Maximum encoded outer Data size, including both signatures and names. */
+  size_t maxPacketSize = ndn::MAX_NDN_PACKET_SIZE;
+
+  /**
+   * @brief Accept a topic publication using its application name and mapping blocks.
+   *
+   * Producer subscriptions are unaffected. Called before queuing topic delivery;
+   * a matching producer subscription may already have fetched the Data.
+   */
+  std::function<bool(const Name&, const std::vector<Block>&)> mappingFilter;
+
+  /** @brief Append MappingData after the StateVector in signed State Vector Data; off by default. */
+  bool useMappingPiggyback = false;
 };
 
 /**
@@ -57,6 +87,10 @@ struct SVSPubSubOptions
  * This interface provides a high level API to use SVS for pub/sub applications.
  * Every node can produce data under a prefix which is served to subscribers
  * for that stream.
+ * Publication may run concurrently with one Face event loop. Subscription changes
+ * must run on that loop or while it is stopped. Signer/store configuration and
+ * destruction must be externally serialized with publication. Custom signers and
+ * stores must support concurrent publication and reception.
  */
 class SVSPubSub : noncopyable
 {
@@ -77,7 +111,7 @@ public:
             const SVSPubSubOptions& options = {},
             const SecurityOptions& securityOptions = SecurityOptions::DEFAULT);
 
-  virtual ~SVSPubSub() = default;
+  virtual ~SVSPubSub();
 
   struct SubscriptionData
   {
@@ -155,6 +189,7 @@ public:
    *
    * This method provides a low level API to publish signed Data packets.
    * Using the publish method is recommended for most applications.
+   * The packet must not have FinalBlockId; use publish for segmented blobs.
    *
    * @param data Data packet to publish
    * @param nodePrefix Name to publish the data under
@@ -181,27 +216,42 @@ private:
     bool prefetch;
   };
 
-  void onSyncData(const Data& syncData, const std::pair<Name, SeqNo>& publication);
+  using PublicationKey = std::tuple<Name, BootstrapTime, SeqNo>;
+
+  std::vector<Subscription> getSubscriptions(const PublicationKey& publication, const Name& name);
+
+  void onSyncData(const Data& syncData,
+                  const PublicationKey& publication,
+                  int retries,
+                  int validationRetries);
 
   void updateCallbackInternal(const std::vector<MissingDataInfo>& info);
 
   Block onGetExtraData(const VersionVector& vv);
 
-  void onRecvExtraData(const Block& block);
+  void onRecvExtraData(const Block& block, const VersionVector& vv);
 
   /// @brief Insert a mapping entry into the store
-  void insertMapping(const NodeID& nid, SeqNo seqNo, const Name& name, std::vector<Block> additional);
+  void insertMapping(const NodeID& nid,
+                     BootstrapTime bootstrapTime,
+                     SeqNo seqNo,
+                     const Name& name,
+                     std::vector<Block> additional);
 
   /**
    * @brief Get and process mapping from store.
    * @returns true if new publications were queued for fetch
    * @throws std::exception error if mapping is not found
    */
-  bool processMapping(const NodeID& nodeId, SeqNo seqNo);
+  bool processMapping(const NodeID& nodeId, BootstrapTime bootstrapTime, SeqNo seqNo);
 
   void fetchAll();
 
-  void cleanUpFetch(const std::pair<Name, SeqNo>& publication);
+  void fetchPublication(const PublicationKey& publication, int retries, int validationRetries);
+
+  void cleanUpFetch(const PublicationKey& publication);
+
+  void failFetch(const PublicationKey& publication);
 
 public:
   static inline const Name EMPTY_NAME;
@@ -216,24 +266,26 @@ private:
   const SVSPubSubOptions m_opts;
   const SecurityOptions m_securityOptions;
   SVSync m_svsync;
+  ndn::Scheduler m_scheduler;
 
-  // Null validator for segment fetcher
-  // TODO: use a real validator here
-  ndn::security::ValidatorNull m_nullValidator;
+  std::map<PublicationKey, std::shared_ptr<ndn::SegmentFetcher>> m_segmentFetchers;
+  std::shared_ptr<int> m_lifetime = std::make_shared<int>(0);
 
   // Provider for mapping interests
   MappingProvider m_mappingProvider;
 
   // MappingList to be sent in the next update with sync interest
   MappingList m_notificationMappingList;
+  std::mutex m_notificationMutex;
 
-  uint32_t m_subscriptionCount;
+  uint32_t m_subscriptionCount = 0;
   std::vector<Subscription> m_producerSubscriptions;
   std::vector<Subscription> m_prefixSubscriptions;
 
   // Queue of publications to fetch
-  std::map<std::pair<Name, SeqNo>, std::vector<Subscription>> m_fetchMap;
-  std::map<std::pair<Name, SeqNo>, bool> m_fetchingMap;
+  std::map<PublicationKey, std::vector<Subscription>> m_fetchMap;
+  // Active fetches and packet segments already delivered to each subscription.
+  std::map<PublicationKey, std::set<std::pair<uint32_t, uint64_t>>> m_fetchingMap;
 };
 
 } // namespace ndn::svs

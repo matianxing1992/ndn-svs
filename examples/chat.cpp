@@ -34,10 +34,10 @@ public:
   Program(const Options& options)
     : m_options(options)
   {
-    // Use HMAC signing for Sync Interests
+    // Use HMAC signing for State Vector Data and publication Data.
     // Note: this is not generally recommended, but is used here for simplicity
     ndn::svs::SecurityOptions securityOptions(m_keyChain);
-    securityOptions.interestSigner->signingInfo.setSigningHmacKey("dGhpcyBpcyBhIHNlY3JldCBtZXNzYWdl");
+    securityOptions.dataSigner->signingInfo.setSigningHmacKey("dGhpcyBpcyBhIHNlY3JldCBtZXNzYWdl");
 
     // Create the SVSync instance
     m_svs = std::make_shared<ndn::svs::SVSync>(
@@ -58,7 +58,6 @@ public:
     std::thread svsThread([this] { face.processEvents(); });
 
     // Announce our presence.
-    // Note that the SVSync instance is thread-safe.
     publishMsg("User " + m_options.m_id + " has joined the groupchat");
 
     // Read from stdin and publish messages.
@@ -84,7 +83,7 @@ protected:
       for (ndn::svs::SeqNo s = v[i].low; s <= v[i].high; ++s) {
         // Request a single data packet using the SVSync API
         ndn::svs::NodeID nid = v[i].nodeId;
-        m_svs->fetchData(nid, s, [nid](const auto& data) {
+        m_svs->fetchData(nid, v[i].bootstrapTime, s, [nid] (const auto& data) {
           std::string content(reinterpret_cast<const char*>(data.getContent().value()),
                               data.getContent().value_size());
           std::cout << data.getName() << " : " << content << std::endl;
@@ -115,7 +114,7 @@ int
 main(int argc, char** argv)
 {
   if (argc != 2) {
-    std::cerr << "Usage: " << argv[0] << " <prefix>" << std::endl;
+    std::cerr << "Usage: " << argv[0] << " <node-prefix>" << std::endl;
     return 1;
   }
 

@@ -19,6 +19,15 @@
 
 namespace ndn::svs {
 
+static inline bool
+isBootstrapTimeTooFarInFuture(BootstrapTime bootstrapTime)
+{
+  const auto now = static_cast<BootstrapTime>(
+    time::toUnixTimestamp<time::seconds>(time::system_clock::now()).count());
+  const auto futureTolerance = time::duration_cast<time::seconds>(time::hours(24)).count();
+  return bootstrapTime > now + futureTolerance;
+}
+
 VersionVector::VersionVector(const ndn::Block& block)
 {
   if (block.type() != tlv::StateVector)
@@ -31,10 +40,39 @@ VersionVector::VersionVector(const ndn::Block& block)
       NDN_THROW(ndn::tlv::Error("StateVectorEntry", it->type()));
 
     it->parse();
-    NodeID nodeId(it->elements().at(0));
-    SeqNo seqNo = ndn::encoding::readNonNegativeInteger(it->elements().at(1));
+    const auto& elements = it->elements();
+    const bool hasNodeName = !elements.empty() && elements.front().type() == ndn::tlv::Name;
+    if (!hasNodeName) {
+      NDN_THROW(ndn::tlv::Error("Name", elements.empty() ? 0 : elements.front().type()));
+    }
 
-    m_map[nodeId] = seqNo;
+    NodeID nodeId(elements.front());
+    insert(nodeId);
+    for (auto seqIt = elements.begin() + 1; seqIt != elements.end(); ++seqIt) {
+      if (seqIt->type() == tlv::SeqNoEntry) {
+        seqIt->parse();
+        const auto& seqElements = seqIt->elements();
+        const bool hasValidSequence = seqElements.size() == 2 &&
+                                      seqElements.at(0).type() == tlv::BootstrapTime &&
+                                      seqElements.at(1).type() == tlv::SeqNo;
+        if (!hasValidSequence) {
+          NDN_THROW(ndn::tlv::Error("SeqNoEntry", seqIt->type()));
+        }
+        BootstrapTime bootstrapTime =
+          ndn::encoding::readNonNegativeInteger(seqIt->elements().at(0));
+        if (isBootstrapTimeTooFarInFuture(bootstrapTime)) {
+          NDN_THROW(Error("State vector bootstrap time is too far in the future"));
+        }
+        SeqNo seqNo = ndn::encoding::readNonNegativeInteger(seqIt->elements().at(1));
+        if (seqNo == 0) {
+          NDN_THROW(Error("State vector sequence number must be positive"));
+        }
+        set(nodeId, bootstrapTime, seqNo);
+        continue;
+      }
+
+      NDN_THROW(ndn::tlv::Error("SeqNoEntry", seqIt->type()));
+    }
   }
 }
 
@@ -45,8 +83,18 @@ VersionVector::encode() const
   size_t totalLength = 0;
 
   for (auto it = m_map.rbegin(); it != m_map.rend(); it++) {
-    // SeqNo
-    size_t entryLength = ndn::encoding::prependNonNegativeIntegerBlock(enc, tlv::SeqNo, it->second);
+    size_t entryLength = 0;
+
+    for (auto seqIt = it->second.rbegin(); seqIt != it->second.rend(); ++seqIt) {
+      size_t seqEntryLength = 0;
+      seqEntryLength +=
+        ndn::encoding::prependNonNegativeIntegerBlock(enc, tlv::SeqNo, seqIt->second);
+      seqEntryLength +=
+        ndn::encoding::prependNonNegativeIntegerBlock(enc, tlv::BootstrapTime, seqIt->first);
+      entryLength += enc.prependVarNumber(seqEntryLength);
+      entryLength += enc.prependVarNumber(tlv::SeqNoEntry);
+      entryLength += seqEntryLength;
+    }
 
     // NodeID (Name)
     entryLength += ndn::encoding::prependBlock(enc, it->first.wireEncode());
@@ -66,7 +114,11 @@ VersionVector::toStr() const
 {
   std::ostringstream stream;
   for (const auto& elem : m_map) {
-    stream << elem.first << ":" << elem.second << " ";
+    stream << elem.first << ":";
+    for (const auto& seqEntry : elem.second) {
+      stream << "[" << seqEntry.first << "," << seqEntry.second << "]";
+    }
+    stream << " ";
   }
   return stream.str();
 }

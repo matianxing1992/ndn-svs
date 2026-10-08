@@ -7,6 +7,9 @@ This library provides an implementation of the [State Vector Sync (SVS)](https:/
 protocol and the [Pub/Sub API](https://dl.acm.org/doi/abs/10.1145/3460417.3483376) for state
 synchronization between multiple clients over NDN.
 
+This implementation targets SVS version 3 ([2026-07-17 specification](https://github.com/named-data/StateVectorSync/blob/8f0b1c5332ff7e7c56b8c5edc247e5f42b671b11/Specification.md))
+and SVS-PS version 3 ([2026-07-24 specification](https://github.com/named-data/StateVectorSync/blob/8f0b1c5332ff7e7c56b8c5edc247e5f42b671b11/PubSubSpec.md)).
+
 ndn-svs uses the [ndn-cxx](https://github.com/named-data/ndn-cxx) library.
 
 ## Installation
@@ -32,7 +35,7 @@ To try out the demo CLI chat application:
 
     ./waf configure --enable-static --disable-shared --with-examples
     ./waf
-    ./build/examples/chat <prefix>
+    ./build/examples/chat <node-prefix>
 
 Configure NFD to be multicast:
 

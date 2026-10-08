@@ -19,10 +19,14 @@
 
 #include "common.hpp"
 
+#include <mutex>
+
 namespace ndn::svs {
 
 /**
  * A simple interface for a validator for data and interests
+ *
+ * Implementations must complete their callbacks on the caller's Face event loop.
  */
 class BaseValidator : noncopyable
 {
@@ -33,12 +37,16 @@ public:
    * @brief Asynchronously validate @p data
    *
    * @note @p successCb and @p failureCb must not be nullptr
+   *
+   * Derived validators must explicitly accept or reject the Data.
    */
   virtual void validate(const Data& data,
                         const ndn::security::DataValidationSuccessCallback& successCb,
                         const ndn::security::DataValidationFailureCallback& failureCb)
   {
-    successCb(data);
+    failureCb(data,
+              security::ValidationError(security::ValidationError::POLICY_ERROR,
+                                        "Data validator is not configured"));
   }
 
   /**
@@ -86,7 +94,9 @@ public:
   void sign(Data& data) const override;
 
 private:
+  friend class SecurityOptions;
   KeyChain& m_keyChain;
+  std::shared_ptr<std::mutex> m_mutex = std::make_shared<std::mutex>();
 };
 
 /**
@@ -98,17 +108,22 @@ public:
   explicit SecurityOptions(KeyChain& keyChain);
 
 public:
-  /** Signing options for sync interests */
+  /** Generic Interest signer retained for API compatibility; Sync signs embedded Data. */
   std::shared_ptr<BaseSigner> interestSigner;
   /** Signing options for data packets */
   std::shared_ptr<BaseSigner> dataSigner;
   /** Signing options for publication (encapsulated) packets */
   std::shared_ptr<BaseSigner> pubSigner;
 
-  /** Validator to validate data and interests (unless using HMAC) */
+  /** Validator for State Vector Data and outer publication Data, including HMAC */
   std::shared_ptr<BaseValidator> validator;
   /** Validator to validate encapsulated data */
   std::shared_ptr<BaseValidator> encapsulatedDataValidator;
+
+  /** Mapping signer; when unset, use dataSigner. */
+  std::shared_ptr<BaseSigner> mappingSigner;
+  /** Mapping validator; when unset, use validator. */
+  std::shared_ptr<BaseValidator> mappingValidator;
 
   /** Number of retries on validation fail */
   int nRetriesOnValidationFail = 0;

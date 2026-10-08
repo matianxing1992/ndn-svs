@@ -22,6 +22,8 @@
 #include "security-options.hpp"
 #include "store.hpp"
 
+#include <mutex>
+
 namespace ndn::svs {
 
 /**
@@ -33,6 +35,10 @@ namespace ndn::svs {
  *
  * This interface also simplifies data fetching.  Client only needs to provide a
  * data fetching strategy (through a updateCallback).
+ * publishData() may run concurrently with one Face event loop. Other methods,
+ * callbacks, and destruction must run on that loop or while it is stopped.
+ * Signer/store configuration and destruction must be externally serialized with publication;
+ * custom signers and stores must support concurrent publication and reception.
  *
  * @param syncPrefix The prefix of the sync group
  * @param dataPrefix The prefix to listen for data on
@@ -51,7 +57,8 @@ public:
              ndn::Face& face,
              const UpdateCallback& updateCallback,
              const SecurityOptions& securityOptions = SecurityOptions::DEFAULT,
-             std::shared_ptr<DataStore> dataStore = DEFAULT_DATASTORE);
+             std::shared_ptr<DataStore> dataStore = DEFAULT_DATASTORE,
+             std::optional<BootstrapTime> bootstrapTime = std::nullopt);
 
   virtual ~SVSyncBase() = default;
 
@@ -117,12 +124,14 @@ public:
    * @brief Retrive a data packet with a particular seqNo from a session
    *
    * @param nid The name of the target node
+   * @param bootstrapTime Session timestamp from the update callback
    * @param seq The seqNo of the data packet.
    * @param onValidated The callback when the retrieved packet has been
    * validated.
    * @param nRetries The number of retries.
    */
   void fetchData(const NodeID& nid,
+                 const BootstrapTime& bootstrapTime,
                  const SeqNo& seq,
                  const DataValidatedCallback& onValidated,
                  int nRetries = 0);
@@ -131,6 +140,7 @@ public:
    * @brief Retrive a data packet with a particular seqNo from a session
    *
    * @param nid The name of the target node
+   * @param bootstrapTime Session timestamp from the update callback
    * @param seq The seqNo of the data packet.
    * @param onValidated The callback when the retrieved packet has been
    * validated.
@@ -140,6 +150,7 @@ public:
    * @param nRetries The number of retries.
    */
   void fetchData(const NodeID& nid,
+                 const BootstrapTime& bootstrapTime,
                  const SeqNo& seq,
                  const DataValidatedCallback& onValidated,
                  const DataValidationErrorCallback& onValidationFailed,
@@ -167,13 +178,34 @@ protected:
    * data prefix for proper functionality, or the application must
    * independently produce data under the prefix.
    */
-  virtual Name getDataName(const NodeID& nid, const SeqNo& seqNo) = 0;
+  virtual Name getDataName(const NodeID& nid,
+                           const BootstrapTime& bootstrapTime,
+                           const SeqNo& seqNo) = 0;
 
 public:
   static inline const NodeID EMPTY_NODE_ID;
   static inline const std::shared_ptr<DataStore> DEFAULT_DATASTORE;
 
 private:
+  friend class SVSPubSub;
+
+  void registerDataPrefix(const NodeID& nid);
+
+  /**
+   * Build and sign a packet without storing or announcing it.
+   * Omit both segment fields for an unsegmented packet. Returns nullptr if its
+   * encoded size exceeds maxPacketSize or MAX_NDN_PACKET_SIZE.
+   * Schedules serving-prefix registration if needed when the packet fits.
+   */
+  std::shared_ptr<const Data> prepareDataPacket(const Block& content,
+                                                time::milliseconds freshness,
+                                                const NodeID& nid,
+                                                SeqNo seq,
+                                                std::optional<size_t> segNo,
+                                                std::optional<Name::Component> finalBlock,
+                                                uint32_t contentType,
+                                                size_t maxPacketSize = ndn::MAX_NDN_PACKET_SIZE);
+
   void onDataInterest(const Interest& interest);
 
   void onDataValidated(const Data& data, const DataValidatedCallback& dataCallback);
@@ -197,14 +229,19 @@ protected:
   const NodeID m_id;
 
 private:
+  friend class SVSPubSub;
   Face& m_face;
   ndn::ScopedRegisteredPrefixHandle m_registeredDataPrefix;
+  std::map<NodeID, ndn::ScopedRegisteredPrefixHandle> m_registeredAliases;
+  std::mutex m_aliasMutex;
+  std::mutex m_publicationMutex;
   Fetcher m_fetcher;
 
   const UpdateCallback m_onUpdate;
 
   std::shared_ptr<DataStore> m_dataStore;
   SVSyncCore m_core;
+  std::shared_ptr<int> m_lifetime = std::make_shared<int>(0);
 };
 
 } // namespace ndn::svs

@@ -24,8 +24,9 @@
 #include <ndn-cxx/util/random.hpp>
 #include <ndn-cxx/util/scheduler.hpp>
 
-#include <atomic>
 #include <mutex>
+#include <optional>
+#include <set>
 
 namespace ndn::svs {
 
@@ -40,6 +41,8 @@ public:
   SeqNo high;
   /// @brief ndn::lp::IncomingFaceIdTag
   uint64_t incomingFace;
+  /** @brief Bootstrap time identifying the reported node's SVS session, in Unix seconds. */
+  BootstrapTime bootstrapTime = 0;
 };
 
 /**
@@ -52,6 +55,10 @@ using UpdateCallback = std::function<void(const std::vector<MissingDataInfo>&)>;
 
 /**
  * @brief Pure SVS
+ *
+ * Sequence reads and updates may run concurrently with one Face event loop.
+ * Configuration, mutable state access, and destruction must be externally
+ * serialized. The update callback runs on the Face loop and may destroy the core.
  */
 class SVSyncCore : noncopyable
 {
@@ -69,20 +76,24 @@ public:
    * @param face The face used to communication
    * @param syncPrefix The prefix of the sync group
    * @param onUpdate The callback function to handle state updates
-   * @param syncKey Base64 encoded key to sign sync interests
+   * @param securityOptions Signer and validator configuration
    * @param nid ID for the node
+   * @param bootstrapTime Persisted session timestamp in Unix seconds; defaults to now
+   * Reusing a session also requires restoring its publication sequence and Data store.
    */
   SVSyncCore(ndn::Face& face,
              const Name& syncPrefix,
              const UpdateCallback& onUpdate,
              const SecurityOptions& securityOptions = SecurityOptions::DEFAULT,
-             const NodeID& nid = EMPTY_NODE_ID);
+             const NodeID& nid = EMPTY_NODE_ID,
+             std::optional<BootstrapTime> bootstrapTime = std::nullopt);
+
+  ~SVSyncCore();
 
   /**
-   * @brief Reset the sync tree (and restart synchronization again)
+   * @brief Compatibility no-op; synchronization state is not reset.
    *
-   * @param isOnInterest a flag that tells whether the reset is called by reset
-   * interest.
+   * @param isOnInterest Ignored.
    */
   void reset(bool isOnInterest = false);
 
@@ -97,14 +108,20 @@ public:
   }
 
   /**
-   * @brief Get current seqNo of the local session.
+   * @brief Get the sequence number for @p nid at this core's bootstrap time.
    *
-   * This method gets the seqNo according to prefix, if prefix is not specified,
-   * it returns the seqNo of default user.
+   * An omitted node ID selects the local node. To read a remote session, use
+   * getState().get(nid, bootstrapTime) with that session's bootstrap time.
    *
-   * @param prefix prefix of the node
+   * @param nid node ID; defaults to the local node
    */
   SeqNo getSeqNo(const NodeID& nid = EMPTY_NODE_ID) const;
+
+  BootstrapTime
+  getBootstrapTime() const
+  {
+    return m_bootstrapTime;
+  }
 
   /**
    * @brief Update the seqNo of the local session
@@ -113,6 +130,7 @@ public:
    *
    * @param seq The new seqNo.
    * @param nid The NodeID of node to update.
+   * @throws std::invalid_argument if seq is zero or decreases within this session.
    */
   void updateSeqNo(const SeqNo& seq, const NodeID& nid = EMPTY_NODE_ID);
 
@@ -125,8 +143,9 @@ public:
   /**
    * @brief Callback to get extra data block for sync interest.
    *
-   * The version vector will be locked during the duration of this callback,
-   * so it must return FAST!
+   * Called on the Face's event loop while preparing a State Vector Data packet.
+   * The callback may read state but must not publish or destroy this core.
+   * It must return one MappingData block or an invalid Block to omit the extension.
    */
   void setGetExtraBlockCallback(const GetExtraBlockCallback& callback)
   {
@@ -134,8 +153,9 @@ public:
   }
 
   /**
-   * @brief Callback on receiving extra data in a sync interest.
-   * Will be called BEFORE the interest is processed.
+   * @brief Callback on receiving MappingData in State Vector Data.
+   * Called after configured validation succeeds, before merging the state vector.
+   * Not called when no validator is configured.
    */
   void setRecvExtraBlockCallback(const RecvExtraBlockCallback& callback)
   {
@@ -151,15 +171,16 @@ public:
   /// @brief Get human-readable representation of version vector
   std::string getStateStr() const
   {
+    std::lock_guard<std::mutex> lock(m_vvMutex);
     return m_vv.toStr();
   }
 
   NDN_SVS_PUBLIC_WITH_TESTS_ELSE_PRIVATE : void onSyncInterest(const Interest& interest);
 
-  void onSyncInterestValidated(const Interest& interest);
+  void onSyncInterestValidated(const Data& data, uint64_t incomingFace);
 
   /**
-   * @brief Mark the instance as initialized and send the first interest
+   * @brief Schedule the first interest if no notification is pending
    */
   void sendInitialInterest();
 
@@ -167,10 +188,10 @@ public:
    * @brief sendSyncInterest and schedule a new retxSyncInterest event.
    *
    * @param send Send a sync interest immediately
-   * @param delay Delay in milliseconds to schedule next interest (0 for
+   * @param delay Delay in milliseconds to schedule next interest (-1 for
    * default).
    */
-  void retxSyncInterest(bool send, unsigned int delay);
+  void retxSyncInterest(bool send, int delay = -1);
 
   /**
    * @brief Add one sync interest to queue.
@@ -186,6 +207,8 @@ public:
     bool myVectorNew = false;
     /// @brief If the incoming state vector has newer entries
     bool otherVectorNew = false;
+    /** @brief All entries newer than the incoming vector were updated recently. */
+    bool recentUpdatesOnly = true;
     /// @brief Newly learned missing information from incoming state vector
     std::vector<MissingDataInfo> missingInfo;
   };
@@ -205,8 +228,7 @@ public:
   bool recordVector(const VersionVector& vvOther);
 
   /**
-   * @brief Enter suppression state by setting
-   * m_recording to True and initializing m_recordedVv to vvOther.
+   * @brief Enter suppression state by initializing m_recordedVv to vvOther.
    * Does nothing if already in suppression state
    *
    * @param vvOther first vector to record
@@ -231,6 +253,7 @@ private:
   const Name m_syncPrefix;
   const SecurityOptions m_securityOptions;
   const NodeID m_id;
+  const BootstrapTime m_bootstrapTime;
   ndn::ScopedRegisteredPrefixHandle m_syncRegisteredPrefix;
 
   const UpdateCallback m_onUpdate;
@@ -240,7 +263,6 @@ private:
   mutable std::mutex m_vvMutex;
   // Aggregates incoming vectors while in suppression state
   std::unique_ptr<VersionVector> m_recordedVv = nullptr;
-  mutable std::mutex m_recordedVvMutex;
 
   // Extra block
   GetExtraBlockCallback m_getExtraBlock;
@@ -263,19 +285,12 @@ private:
   // Milliseconds to send sync interest reply after
   std::uniform_int_distribution<> m_intrReplyDist;
 
-  // Security
-  ndn::KeyChain m_keyChainMem;
+  // Invalidates deferred validation callbacks when the core is destroyed.
+  std::shared_ptr<int> m_lifetime = std::make_shared<int>(0);
 
   ndn::Scheduler m_scheduler;
-  mutable std::mutex m_schedulerMutex;
   scheduler::ScopedEventId m_retxEvent;
-  scheduler::ScopedEventId m_packetEvent;
-
-  // Time at which the next sync interest will be sent
-  std::atomic_long m_nextSyncInterest;
-
-  // Prevent sending interests before initialization
-  bool m_initialized = false;
+  scheduler::ScopedEventId m_registrationFailureEvent;
 };
 
 } // namespace ndn::svs

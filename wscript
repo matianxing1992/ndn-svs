@@ -32,8 +32,6 @@ def options(opt):
     optgrp.add_option('--with-tests', action='store_true', default=False,
                       help='Build unit tests')
 
-    optgrp.add_option('--with-compression', action='store_true', default=False,
-                      help='Build with state vector compression extension')
 
 def configure(conf):
     conf.start_msg('Building static library')
@@ -71,11 +69,7 @@ def configure(conf):
     conf.check_cfg(package='libndn-cxx', args=['libndn-cxx >= 0.9.0', '--cflags', '--libs'],
                    uselib_store='NDN_CXX', pkg_config_path=pkg_config_path)
 
-    boost_libs = []
-    if conf.options.with_compression:
-        boost_libs.append('iostreams')
-
-    conf.check_boost(lib=boost_libs, mt=True)
+    conf.check_boost(lib=[], mt=True)
     if conf.env.BOOST_VERSION_NUMBER < 107400:
         conf.fatal('The minimum supported version of Boost is 1.74.0.\n'
                    'Please upgrade your distribution or manually install a newer version of Boost.\n'
@@ -95,7 +89,6 @@ def configure(conf):
     # system has a different version of the ndn-svs library installed.
     conf.env.prepend_value('STLIBPATH', ['.'])
 
-    conf.define_cond('COMPRESSION', conf.options.with_compression)
     conf.define_cond('HAVE_TESTS', conf.env.WITH_TESTS)
     # The config header will contain all defines that were added using conf.define()
     # or conf.define_cond().  Everything that was added directly to conf.env.DEFINES

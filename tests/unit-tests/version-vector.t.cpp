@@ -19,6 +19,10 @@
 
 #include "tests/boost-test.hpp"
 
+#include <ndn-cxx/util/time-unit-test-clock.hpp>
+
+#include <limits>
+
 namespace ndn::tests {
 
 using namespace ndn::svs;
@@ -28,8 +32,14 @@ class VersionVectorFixture
 protected:
   VersionVectorFixture()
   {
-    v.set("one", 1);
-    v.set("two", 2);
+    time::setCustomClocks(nullptr, std::make_shared<time::UnitTestSystemClock>());
+    v.set("one", 100, 1);
+    v.set("two", 200, 2);
+  }
+
+  ~VersionVectorFixture()
+  {
+    time::setCustomClocks();
   }
 
 protected:
@@ -37,6 +47,30 @@ protected:
 };
 
 BOOST_FIXTURE_TEST_SUITE(TestVersionVector, VersionVectorFixture)
+
+BOOST_AUTO_TEST_CASE(CanonicalOrderIncludesTypedComponentsAndMaximumSequence)
+{
+  VersionVector vector;
+  const auto last = std::numeric_limits<SeqNo>::max();
+  for (const Name& name :
+       {Name("/node").appendSequenceNumber(0),
+        Name("/node").appendTimestamp(time::fromUnixTimestamp(time::seconds(100))),
+        Name("/node").appendVersion(0),
+        Name("/node").appendSegment(0),
+        Name("/node/x")})
+    vector.set(name, 100, last);
+  const std::vector<uint32_t> expected{8, 50, 54, 56, 58};
+  auto block = vector.encode();
+  block.parse();
+  BOOST_REQUIRE_EQUAL(block.elements_size(), expected.size());
+  for (size_t i = 0; i < expected.size(); ++i) {
+    auto entry = block.elements()[i];
+    entry.parse();
+    const Name name(entry.elements().front());
+    BOOST_CHECK_EQUAL(name[-1].type(), expected[i]);
+    BOOST_CHECK_EQUAL(VersionVector(block).get(name, 100), last);
+  }
+}
 
 BOOST_AUTO_TEST_CASE(Get)
 {
@@ -47,15 +81,16 @@ BOOST_AUTO_TEST_CASE(Get)
 
 BOOST_AUTO_TEST_CASE(Set)
 {
-  BOOST_CHECK_EQUAL(v.set("four", 44), 44);
+  BOOST_CHECK_EQUAL(v.set("four", 400, 44), 44);
   BOOST_CHECK_EQUAL(v.get("four"), 44);
+  BOOST_CHECK_EQUAL(v.get("four", 400), 44);
 }
 
 BOOST_AUTO_TEST_CASE(Iterate)
 {
   std::unordered_map<NodeID, SeqNo> umap;
   for (auto elem : v) {
-    umap[elem.first] = elem.second;
+    umap[elem.first] = elem.second.rbegin()->second;
   }
 
   BOOST_CHECK_EQUAL(umap["one"], 1);
@@ -66,31 +101,45 @@ BOOST_AUTO_TEST_CASE(Iterate)
 BOOST_AUTO_TEST_CASE(EncodeDecode)
 {
   ndn::Block block = v.encode();
-  BOOST_CHECK_EQUAL(block.value_size(), 24);
+  BOOST_CHECK_GT(block.value_size(), 24);
 
   VersionVector dv(block);
   BOOST_CHECK_EQUAL(dv.get("one"), 1);
   BOOST_CHECK_EQUAL(dv.get("two"), 2);
+  BOOST_CHECK_EQUAL(dv.get("one", 100), 1);
+  BOOST_CHECK_EQUAL(dv.get("two", 200), 2);
 }
 
 BOOST_AUTO_TEST_CASE(DecodeStatic)
 {
-  // Hex: CA0A070508036F6E65CC0101CA0A0705080374776FCC0102
+  // Legacy pre-v3 format used StateVectorEntry(Name, SeqNo) without SeqNoEntry.
   constexpr std::string_view encoded{ "\xCA\x0A\x07\x05\x08\x03\x6F\x6E\x65\xCC\x01\x01"
                                       "\xCA\x0A\x07\x05\x08\x03\x74\x77\x6F\xCC\x01\x02" };
-  VersionVector dv(ndn::encoding::makeStringBlock(svs::tlv::StateVector, encoded));
-  BOOST_CHECK_EQUAL(dv.get("one"), 1);
-  BOOST_CHECK_EQUAL(dv.get("two"), 2);
+  BOOST_CHECK_THROW(VersionVector(ndn::encoding::makeStringBlock(svs::tlv::StateVector, encoded)),
+                    ndn::tlv::Error);
+}
+
+BOOST_AUTO_TEST_CASE(MultipleBootstraps)
+{
+  VersionVector vector;
+  vector.set("node", 100, 10);
+  vector.set("node", 200, 1);
+
+  VersionVector decoded(vector.encode());
+  BOOST_CHECK_EQUAL(decoded.get("node", 100), 10);
+  BOOST_CHECK_EQUAL(decoded.get("node", 200), 1);
+  BOOST_CHECK_EQUAL(decoded.get("node"), 1);
+  BOOST_CHECK_EQUAL(decoded.begin()->second.size(), 2);
 }
 
 BOOST_AUTO_TEST_CASE(Ordering)
 {
   VersionVector v1;
-  v1.set("one", 1);
-  v1.set("two", 2);
+  v1.set("one", 100, 1);
+  v1.set("two", 200, 2);
   VersionVector v2;
-  v2.set("two", 2);
-  v2.set("one", 1);
+  v2.set("two", 200, 2);
+  v2.set("one", 100, 1);
 
   Block v1e = v1.encode();
   Block v2e = v2.encode();
@@ -99,6 +148,29 @@ BOOST_AUTO_TEST_CASE(Ordering)
   std::string v2str(reinterpret_cast<const char*>(v2e.value()), v2e.value_size());
 
   BOOST_CHECK_EQUAL(v1str, v2str);
+}
+
+BOOST_AUTO_TEST_CASE(RejectInvalidSequenceAndBootstrapTime)
+{
+  const auto now = static_cast<BootstrapTime>(
+    time::toUnixTimestamp<time::seconds>(time::system_clock::now()).count());
+
+  VersionVector zero;
+  BOOST_CHECK_THROW(zero.set("peer", 100, 0), std::invalid_argument);
+  BOOST_CHECK_EQUAL(zero.get("peer"), 0);
+
+  VersionVector boundary;
+  boundary.set("peer", now + 86400, 1);
+  BOOST_CHECK_NO_THROW(VersionVector(boundary.encode()));
+
+  VersionVector invalid;
+  invalid.set("peer", now + 86401, 1);
+  BOOST_CHECK_THROW(VersionVector(invalid.encode()), VersionVector::Error);
+
+  VersionVector next;
+  next.set("peer", now, 2);
+  auto decoded = VersionVector(next.encode());
+  BOOST_CHECK_EQUAL(decoded.get("peer", now), 2);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

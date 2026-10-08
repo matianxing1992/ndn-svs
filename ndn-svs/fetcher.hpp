@@ -80,6 +80,7 @@ private:
 
   // Interests yet to be sent
   std::queue<QueuedInterest> m_interestQueue;
+  std::shared_ptr<int> m_lifetime = std::make_shared<int>(0);
 };
 
 } // namespace ndn::svs

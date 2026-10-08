@@ -17,6 +17,8 @@
 #include "fetcher.hpp"
 #include "security-options.hpp"
 
+#include <algorithm>
+
 namespace ndn::svs {
 
 Fetcher::Fetcher(Face& face, const SecurityOptions& securityOptions)
@@ -86,9 +88,16 @@ Fetcher::onData(const Interest& interest, const Data& data, const QueuedInterest
     // No validator provided
     qi.afterSatisfied(interest, data);
   } else {
-    auto onDataValidated = [qi](const Data& data) { qi.afterSatisfied(qi.interest, data); };
+    const std::weak_ptr<int> lifetime = m_lifetime;
+    auto onDataValidated = [qi, lifetime] (const Data& data) {
+      if (!lifetime.expired())
+        qi.afterSatisfied(qi.interest, data);
+    };
 
-    auto onValidationFailed = [this, qi](const Data& data, const ValidationError& error) {
+    auto onValidationFailed = [this, qi, lifetime] (const Data& data,
+                                                    const ValidationError& error) {
+      if (lifetime.expired())
+        return;
       if (qi.nRetriesOnValidationFail > 0) {
         this->m_scheduler.schedule(
           ndn::time::milliseconds(this->m_securityOptions.millisBeforeRetryOnValidationFail), [this, qi] {
@@ -96,15 +105,16 @@ Fetcher::onData(const Interest& interest, const Data& data, const QueuedInterest
             qiNew.nRetriesOnValidationFail--;
             this->expressInterest(qiNew);
           });
+        return;
       }
-      return;
 
       if (qi.afterValidationFailed) {
         qi.afterValidationFailed(data, error);
       }
     };
 
-    m_securityOptions.validator->validate(data, onDataValidated, onValidationFailed);
+    auto validator = m_securityOptions.validator;
+    validator->validate(data, onDataValidated, onValidationFailed);
   }
 }
 
@@ -127,7 +137,13 @@ Fetcher::onTimeout(const Interest& interest, const QueuedInterest& qi)
   }
 
   QueuedInterest qiNew(qi);
-  qiNew.nRetries--;
+  if (qiNew.nRetries > 0) {
+    qiNew.nRetries--;
+  }
+  else {
+    qiNew.interest.setInterestLifetime(
+      std::min(qiNew.interest.getInterestLifetime() * 2, time::milliseconds(30_s)));
+  }
   expressInterest(qiNew);
 }
 
