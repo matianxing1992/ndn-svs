@@ -32,7 +32,7 @@ public:
     using std::runtime_error::runtime_error;
   };
 
-  using const_iterator = std::map<NodeID, SeqNo>::const_iterator;
+  using const_iterator = std::map<NodeID, std::map<BootstrapTime, SeqNo>>::const_iterator;
 
   VersionVector() = default;
 
@@ -45,17 +45,39 @@ public:
   /** Get a human-readable representation */
   std::string toStr() const;
 
-  SeqNo set(const NodeID& nid, SeqNo seqNo)
+  /** Retain a node even when it has no sequence entries */
+  void
+  insert(const NodeID& nid)
   {
-    m_map[nid] = seqNo;
+    if (m_map.try_emplace(nid).second)
+      m_lastUpdate[nid] = time::system_clock::now();
+  }
+
+  SeqNo
+  set(const NodeID& nid, BootstrapTime bootstrapTime, SeqNo seqNo)
+  {
+    if (seqNo == 0)
+      NDN_THROW(std::invalid_argument("SVS sequence number must be positive"));
+    m_map[nid][bootstrapTime] = seqNo;
     m_lastUpdate[nid] = time::system_clock::now();
     return seqNo;
   }
 
+  /** Sequence number in the most recent session of this node */
   SeqNo get(const NodeID& nid) const
   {
-    auto elem = m_map.find(nid);
-    return elem == m_map.end() ? 0 : elem->second;
+    auto node = m_map.find(nid);
+    return node == m_map.end() || node->second.empty() ? 0 : node->second.rbegin()->second;
+  }
+
+  SeqNo
+  get(const NodeID& nid, BootstrapTime bootstrapTime) const
+  {
+    auto node = m_map.find(nid);
+    if (node == m_map.end())
+      return 0;
+    auto entry = node->second.find(bootstrapTime);
+    return entry == node->second.end() ? 0 : entry->second;
   }
 
   time::system_clock::time_point getLastUpdate(const NodeID& nid) const
@@ -80,7 +102,7 @@ public:
   }
 
 private:
-  std::map<NodeID, SeqNo> m_map;
+  std::map<NodeID, std::map<BootstrapTime, SeqNo>> m_map;
   std::map<NodeID, time::system_clock::time_point> m_lastUpdate;
 };
 

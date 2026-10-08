@@ -37,13 +37,10 @@ public:
   Program(const Options& options)
     : m_options(options)
   {
-    // Use HMAC signing for Sync Interests
+    // Use HMAC signing for State Vector Data, outer publication Data, and Mapping Data.
     // Note: this is not generally recommended, but is used here for simplicity
     SecurityOptions secOpts(m_keyChain);
-    secOpts.interestSigner->signingInfo.setSigningHmacKey("dGhpcyBpcyBhIHNlY3JldCBtZXNzYWdl");
-
-    // Sign data packets using SHA256 (for simplicity)
-    secOpts.dataSigner->signingInfo.setSha256Signing();
+    secOpts.dataSigner->signingInfo.setSigningHmacKey("dGhpcyBpcyBhIHNlY3JldCBtZXNzYWdl");
 
     // Do not fetch publications older than 10 seconds
     SVSPubSubOptions opts;
@@ -80,7 +77,6 @@ public:
     std::thread svsThread([this] { face.processEvents(); });
 
     // Announce our presence.
-    // Note that the SVS-PS instance is thread-safe.
     publishMsg("User " + m_options.m_id + " has joined the groupchat");
 
     // Read from stdin and publish messages.
@@ -147,7 +143,7 @@ int
 main(int argc, char** argv)
 {
   if (argc != 2) {
-    std::cerr << "Usage: " << argv[0] << " <prefix>" << std::endl;
+    std::cerr << "Usage: " << argv[0] << " <node-prefix>" << std::endl;
     return 1;
   }
 

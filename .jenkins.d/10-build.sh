@@ -19,7 +19,7 @@ if [[ $JOB_NAME != *code-coverage && $JOB_NAME != *limited-build ]]; then
     ./waf --color=yes distclean
 
     # Build in release mode with examples
-    ./waf --color=yes configure --with-examples --with-compression
+    ./waf --color=yes configure --with-examples
     ./waf --color=yes build
 
     # Cleanup

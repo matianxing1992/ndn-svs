@@ -21,6 +21,8 @@
 
 #include <ndn-cxx/ims/in-memory-storage-persistent.hpp>
 
+#include <mutex>
+
 namespace ndn::svs {
 
 class MemoryDataStore : public DataStore
@@ -28,15 +30,18 @@ class MemoryDataStore : public DataStore
 public:
   std::shared_ptr<const Data> find(const Interest& interest) override
   {
+    std::lock_guard<std::mutex> lock(m_mutex);
     return m_ims.find(interest);
   }
 
   void insert(const Data& data) override
   {
+    std::lock_guard<std::mutex> lock(m_mutex);
     return m_ims.insert(data);
   }
 
 private:
+  std::mutex m_mutex;
   InMemoryStoragePersistent m_ims;
 };
 

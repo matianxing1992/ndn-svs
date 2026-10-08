@@ -25,20 +25,27 @@ BaseSigner::~BaseSigner() = default;
 void
 KeyChainSigner::sign(Interest& interest) const
 {
+  std::lock_guard<std::mutex> lock(*m_mutex);
   m_keyChain.sign(interest, signingInfo);
 }
 
 void
 KeyChainSigner::sign(Data& data) const
 {
+  std::lock_guard<std::mutex> lock(*m_mutex);
   m_keyChain.sign(data, signingInfo);
 }
 
 SecurityOptions::SecurityOptions(KeyChain& keyChain)
-  : interestSigner(std::make_shared<KeyChainSigner>(keyChain))
-  , dataSigner(std::make_shared<KeyChainSigner>(keyChain))
-  , pubSigner(std::make_shared<KeyChainSigner>(keyChain))
 {
+  auto interest = std::make_shared<KeyChainSigner>(keyChain);
+  auto data = std::make_shared<KeyChainSigner>(keyChain);
+  auto publication = std::make_shared<KeyChainSigner>(keyChain);
+  data->m_mutex = interest->m_mutex;
+  publication->m_mutex = interest->m_mutex;
+  interestSigner = std::move(interest);
+  dataSigner = std::move(data);
+  pubSigner = std::move(publication);
   interestSigner->signingInfo.setSignedInterestFormat(security::SignedInterestFormat::V03);
 }
 

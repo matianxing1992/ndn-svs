@@ -19,6 +19,12 @@
 
 #include <ndn-cxx/security/signing-helpers.hpp>
 
+#include <algorithm>
+#include <limits>
+
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/post.hpp>
+
 namespace ndn::svs {
 
 SVSyncBase::SVSyncBase(const Name& syncPrefix,
@@ -27,7 +33,8 @@ SVSyncBase::SVSyncBase(const Name& syncPrefix,
                        ndn::Face& face,
                        const UpdateCallback& updateCallback,
                        const SecurityOptions& securityOptions,
-                       std::shared_ptr<DataStore> dataStore)
+                       std::shared_ptr<DataStore> dataStore,
+                       std::optional<BootstrapTime> bootstrapTime)
   : m_syncPrefix(syncPrefix)
   , m_dataPrefix(dataPrefix)
   , m_securityOptions(securityOptions)
@@ -36,15 +43,27 @@ SVSyncBase::SVSyncBase(const Name& syncPrefix,
   , m_fetcher(face, securityOptions)
   , m_onUpdate(updateCallback)
   , m_dataStore(std::move(dataStore))
-  , m_core(m_face, m_syncPrefix, m_onUpdate, securityOptions, m_id)
+  , m_core(m_face, m_syncPrefix, m_onUpdate, securityOptions, m_id, bootstrapTime)
 {
   // Register new data store
   if (m_dataStore == DEFAULT_DATASTORE)
     m_dataStore = std::make_shared<MemoryDataStore>();
 
   // Register data prefix
-  m_registeredDataPrefix = m_face.setInterestFilter(
-    m_dataPrefix, std::bind(&SVSyncBase::onDataInterest, this, _2), [](auto&&...) {});
+  const std::weak_ptr<int> lifetime = m_lifetime;
+  auto registration = std::make_shared<ndn::RegisteredPrefixHandle>();
+  *registration = m_face.setInterestFilter(
+    m_dataPrefix,
+    [this, lifetime] (const auto&, const Interest& interest) {
+      if (!lifetime.expired())
+        onDataInterest(interest);
+    },
+    [lifetime, registration] (auto&&...) {
+      if (lifetime.expired())
+        registration->unregister();
+    },
+    [] (auto&&...) {});
+  m_registeredDataPrefix = *registration;
 }
 
 SeqNo
@@ -62,16 +81,17 @@ SVSyncBase::publishData(const Block& content,
                         const NodeID& id,
                         uint32_t contentType)
 {
+  std::lock_guard<std::mutex> lock(m_publicationMutex);
   NodeID pubId = id != EMPTY_NODE_ID ? id : m_id;
-  SeqNo newSeq = m_core.getSeqNo(pubId) + 1;
+  const SeqNo previous = m_core.getSeqNo(pubId);
+  if (previous == std::numeric_limits<SeqNo>::max())
+    NDN_THROW(std::overflow_error("publication sequence number is exhausted"));
+  const SeqNo newSeq = previous + 1;
 
-  Name dataName = getDataName(pubId, newSeq);
-  auto data = std::make_shared<Data>(dataName);
-  data->setContent(content);
-  data->setFreshnessPeriod(freshness);
-  data->setContentType(contentType);
-
-  m_securityOptions.dataSigner->sign(*data);
+  auto data =
+    prepareDataPacket(content, freshness, pubId, newSeq, std::nullopt, std::nullopt, contentType);
+  if (!data)
+    NDN_THROW(std::length_error("Data exceeds the packet size limit"));
 
   m_dataStore->insert(*data);
   m_core.updateSeqNo(newSeq, pubId);
@@ -89,14 +109,67 @@ SVSyncBase::insertDataSegment(const Block& content,
                               const Name::Component& finalBlock,
                               uint32_t contentType)
 {
-  Name dataName = getDataName(nid, seq).appendVersion(0).appendSegment(segNo);
+  auto data = prepareDataPacket(content, freshness, nid, seq, segNo, finalBlock, contentType);
+  if (!data)
+    NDN_THROW(std::length_error("Data exceeds the packet size limit"));
+  m_dataStore->insert(*data);
+}
+
+std::shared_ptr<const Data>
+SVSyncBase::prepareDataPacket(const Block& content,
+                              time::milliseconds freshness,
+                              const NodeID& nid,
+                              SeqNo seq,
+                              std::optional<size_t> segNo,
+                              std::optional<Name::Component> finalBlock,
+                              uint32_t contentType,
+                              size_t maxPacketSize)
+{
+  if (segNo.has_value() != finalBlock.has_value())
+    NDN_THROW(std::invalid_argument("segment number and FinalBlockId must be specified together"));
+  Name dataName = getDataName(nid, m_core.getBootstrapTime(), seq);
+  if (segNo)
+    dataName.appendVersion(0).appendSegment(*segNo);
   auto data = std::make_shared<Data>(dataName);
   data->setContent(content);
   data->setFreshnessPeriod(freshness);
   data->setContentType(contentType);
   data->setFinalBlock(finalBlock);
   m_securityOptions.dataSigner->sign(*data);
-  m_dataStore->insert(*data);
+  if (data->wireEncode().size() > std::min(maxPacketSize, ndn::MAX_NDN_PACKET_SIZE))
+    return nullptr;
+  registerDataPrefix(nid);
+  return data;
+}
+
+void
+SVSyncBase::registerDataPrefix(const NodeID& nid)
+{
+  const auto prefix = getDataName(nid, m_core.getBootstrapTime(), 1).getPrefix(-2);
+  if (m_dataPrefix.isPrefixOf(prefix))
+    return;
+  std::lock_guard<std::mutex> lock(m_aliasMutex);
+  if (!m_registeredAliases.emplace(nid, ndn::ScopedRegisteredPrefixHandle()).second)
+    return;
+  const std::weak_ptr<int> lifetime = m_lifetime;
+  boost::asio::post(m_face.getIoContext(), [this, nid, prefix, lifetime] {
+    if (lifetime.expired())
+      return;
+    std::lock_guard<std::mutex> lock(m_aliasMutex);
+    auto registration = std::make_shared<ndn::RegisteredPrefixHandle>();
+    *registration = m_face.setInterestFilter(
+      prefix,
+      [this, lifetime] (const auto&, const Interest& interest) {
+        if (!lifetime.expired())
+          onDataInterest(interest);
+      },
+      [lifetime, registration] (auto&&...) {
+        if (lifetime.expired())
+          registration->unregister();
+      },
+      [] (auto&&...) {});
+    m_registeredAliases.at(nid) = *registration;
+  });
 }
 
 void
@@ -109,6 +182,7 @@ SVSyncBase::onDataInterest(const Interest& interest)
 
 void
 SVSyncBase::fetchData(const NodeID& nid,
+                      const BootstrapTime& bootstrapTime,
                       const SeqNo& seqNo,
                       const DataValidatedCallback& onValidated,
                       int nRetries)
@@ -116,18 +190,19 @@ SVSyncBase::fetchData(const NodeID& nid,
   DataValidationErrorCallback onValidationFailed =
     std::bind(&SVSyncBase::onDataValidationFailed, this, _1, _2);
   TimeoutCallback onTimeout = [](auto&&...) {};
-  fetchData(nid, seqNo, onValidated, onValidationFailed, onTimeout, nRetries);
+  fetchData(nid, bootstrapTime, seqNo, onValidated, onValidationFailed, onTimeout, nRetries);
 }
 
 void
 SVSyncBase::fetchData(const NodeID& nid,
+                      const BootstrapTime& bootstrapTime,
                       const SeqNo& seqNo,
                       const DataValidatedCallback& onValidated,
                       const DataValidationErrorCallback& onValidationFailed,
                       const TimeoutCallback& onTimeout,
                       int nRetries)
 {
-  Name interestName = getDataName(nid, seqNo);
+  Name interestName = getDataName(nid, bootstrapTime, seqNo);
   Interest interest(interestName);
   interest.setCanBePrefix(true);
   interest.setInterestLifetime(2_s);
